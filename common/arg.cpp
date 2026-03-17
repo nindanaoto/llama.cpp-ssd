@@ -2240,6 +2240,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_DIO"));
     add_opt(common_arg(
+        {"--ssd-offload"},
+        "offload MoE expert weights to SSD, load on demand (requires MoE model)",
+        [](common_params & params) {
+            params.use_ssd_offload = true;
+        }
+    ).set_env("LLAMA_ARG_SSD_OFFLOAD"));
+    add_opt(common_arg(
         {"--numa"}, "TYPE",
         "attempt optimizations that help on some NUMA systems\n"
         "- distribute: spread execution evenly over all nodes\n"

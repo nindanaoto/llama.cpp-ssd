@@ -9,14 +9,25 @@
 #include "llama-memory.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
+#include "llama-ssd.h"
 #include "llama-ext.h"
 #include "llama.h"
 
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
+#include <functional>
 #include <limits>
 #include <stdexcept>
+
+// Thread-local storage for SSD eval callback wrapper
+struct ssd_cb_wrapper {
+    static thread_local std::function<bool(ggml_tensor *, bool, void *)> fn;
+    static bool call(ggml_tensor * t, bool ask, void * ud) {
+        return fn(t, ask, ud);
+    }
+};
+thread_local std::function<bool(ggml_tensor *, bool, void *)> ssd_cb_wrapper::fn;
 
 //
 // llama_context
@@ -1326,7 +1337,64 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         res->reset();
 
         ggml_backend_sched_reset(sched.get());
-        ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+
+        if (model.ssd_manager) {
+            // Install SSD-aware eval callback that wraps the original
+            auto * ssd_mgr = model.ssd_manager.get();
+            auto original_cb = cparams.cb_eval;
+            auto original_ud = cparams.cb_eval_user_data;
+
+            // Prefetch experts for layer 0 before graph compute starts
+            ssd_mgr->prefetch_start(0);
+
+            auto ssd_cb = [ssd_mgr, original_cb, original_ud](struct ggml_tensor * t, bool ask, void * /*ud*/) -> bool {
+                const char * name = ggml_get_name(t);
+
+                if (ask) {
+                    // We need to intercept ffn_moe_topk-N nodes to read router results
+                    if (strncmp(name, "ffn_moe_topk-", 13) == 0) {
+                        return true; // yes, we need this tensor's data
+                    }
+                    if (original_cb) {
+                        return original_cb(t, ask, original_ud);
+                    }
+                    return false;
+                }
+
+                // ask == false: node just computed
+                if (strncmp(name, "ffn_moe_topk-", 13) == 0) {
+                    int il = atoi(name + 13);
+
+                    // Read selected expert indices from the tensor
+                    // Shape: [n_expert_used, n_tokens]
+                    const int32_t * selected = (const int32_t *)t->data;
+                    int n_selected = (int)t->ne[0];
+
+                    // Ensure correct experts are loaded and activate the layer
+                    ssd_mgr->ensure_ready(il, selected, n_selected);
+                    ssd_mgr->activate_layer(il);
+
+                    // Update prediction state
+                    ssd_mgr->update_prediction(il, selected, n_selected);
+
+                    // Start speculative prefetch for next layer
+                    if (il + 1 < ssd_mgr->n_layers()) {
+                        ssd_mgr->prefetch_start(il + 1);
+                    }
+                }
+
+                if (original_cb) {
+                    return original_cb(t, ask, original_ud);
+                }
+                return true;
+            };
+
+            // Store the lambda in thread-local storage for C callback compatibility
+            ssd_cb_wrapper::fn = std::move(ssd_cb);
+            ggml_backend_sched_set_eval_callback(sched.get(), ssd_cb_wrapper::call, nullptr);
+        } else {
+            ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+        }
 
         //const auto t_start_us = ggml_time_us();
 
@@ -4082,6 +4150,17 @@ void llama_perf_context_print(const llama_context * ctx) {
             __func__, data.t_eval_ms, data.n_eval, data.t_eval_ms / data.n_eval, 1e3 / data.t_eval_ms * data.n_eval);
     LLAMA_LOG_INFO("%s:       total time = %10.2f ms / %5d tokens\n", __func__, (t_end_ms - data.t_start_ms), (data.n_p_eval + data.n_eval));
     LLAMA_LOG_INFO("%s:    graphs reused = %10d\n", __func__, data.n_reused);
+
+    // Print SSD offloading stats if active
+    if (ctx->get_model().ssd_manager) {
+        auto ssd_stats = ctx->get_model().ssd_manager->get_stats();
+        uint64_t total = ssd_stats.n_prefetch_hits + ssd_stats.n_prefetch_misses;
+        double hit_rate = total > 0 ? 100.0 * ssd_stats.n_prefetch_hits / total : 0.0;
+        LLAMA_LOG_INFO("%s:     SSD offload: %lu loads, %.1f MB read, hit rate %.1f%% (%lu/%lu)\n",
+            __func__, (unsigned long)ssd_stats.n_loads,
+            (double)ssd_stats.bytes_loaded / (1024.0 * 1024.0),
+            hit_rate, (unsigned long)ssd_stats.n_prefetch_hits, (unsigned long)total);
+    }
 }
 
 void llama_perf_context_reset(llama_context * ctx) {

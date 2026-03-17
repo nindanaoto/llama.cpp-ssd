@@ -6,6 +6,7 @@
 #include "llama-arch.h"
 #include "llama-hparams.h"
 #include "llama-mmap.h"
+#include "llama-ssd.h"
 
 #include "ggml-cpp.h"
 
@@ -81,6 +82,7 @@ struct llama_model_loader {
     bool no_alloc;
 
     llama_files files;
+    std::vector<std::string> file_paths; // paths to all GGUF files
     llama_ftype ftype;
     llama_fver  fver;
 
@@ -199,7 +201,8 @@ struct llama_model_loader {
             llama_buf_map & bufs,
             llama_mlocks * lmlocks,
             llama_progress_callback progress_callback,
-            void * progress_callback_user_data);
+            void * progress_callback_user_data,
+            llama_ssd_manager * ssd_manager = nullptr);
 
     std::string ftype_name() const;
 

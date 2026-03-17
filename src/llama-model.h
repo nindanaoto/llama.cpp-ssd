@@ -5,6 +5,7 @@
 #include "llama-graph.h"
 #include "llama-hparams.h"
 #include "llama-memory.h"
+#include "llama-ssd.h"
 #include "llama-vocab.h"
 
 #include <map>
@@ -593,6 +594,9 @@ struct llama_model {
 
     // for quantize-stats only
     std::vector<std::pair<std::string, struct ggml_tensor *>> tensors_by_name;
+
+    // SSD expert weight offloading manager
+    std::unique_ptr<llama_ssd_manager> ssd_manager;
 
     // for keeping track of associated LoRA adapters
     std::unordered_set<llama_adapter_lora *> loras;

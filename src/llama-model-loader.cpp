@@ -554,6 +554,7 @@ llama_model_loader::llama_model_loader(
         llm_kv = LLM_KV(llm_arch_from_string(arch_name));
 
         files.emplace_back(new llama_file(fname.c_str(), "rb", use_direct_io));
+        file_paths.push_back(fname);
         contexts.emplace_back(ctx);
 
         if (use_mmap && use_direct_io) {
@@ -636,6 +637,7 @@ llama_model_loader::llama_model_loader(
                 }
 
                 files.emplace_back(new llama_file(fname_split, "rb", use_direct_io));
+                file_paths.push_back(fname_split);
                 contexts.emplace_back(ctx);
 
                 // Save tensors data offset info of the shard.
@@ -1410,7 +1412,8 @@ bool llama_model_loader::load_all_data(
         llama_buf_map & bufs,
         llama_mlocks * lmlocks,
         llama_progress_callback progress_callback,
-        void * progress_callback_user_data) {
+        void * progress_callback_user_data,
+        llama_ssd_manager * ssd_manager) {
     if (files.empty()) {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
             set_tensor_data(t, set_tensor_data_ud);
@@ -1534,6 +1537,17 @@ bool llama_model_loader::load_all_data(
         }
 
         size_t n_size = ggml_nbytes(cur);
+
+        // SSD offloading: register expert tensors but don't load their data
+        if (ssd_manager && llama_ssd_manager::is_expert_weight(ggml_get_name(cur))) {
+            int layer_idx = -1;
+            sscanf(ggml_get_name(cur), "blk.%d.", &layer_idx);
+            if (layer_idx >= 0) {
+                ssd_manager->register_tensor(cur, weight->idx, weight->offs, layer_idx);
+                size_done += n_size;
+                continue;
+            }
+        }
 
         if (use_mmap) {
             const auto & mapping = mappings.at(weight->idx);

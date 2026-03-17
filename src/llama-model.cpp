@@ -1222,7 +1222,10 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         __func__, ml.use_mmap ? "true" : "false", ml.use_direct_io ? "true" : "false");
 
     // build a list of buffer types for the CPU and GPU devices
-    pimpl->cpu_buft_list = make_cpu_buft_list(devices, params.use_extra_bufts, params.no_host);
+    // Disable extra buffer types (CPU_REPACK) when SSD offloading is active,
+    // since weight repacking conflicts with dynamic data pointer redirection
+    bool use_extra = params.use_extra_bufts && !(params.use_ssd_offload && hparams.n_expert > 0);
+    pimpl->cpu_buft_list = make_cpu_buft_list(devices, use_extra, params.no_host);
     for (const auto & dev : devices) {
         buft_list_t buft_list = make_gpu_buft_list(dev.dev, split_mode, tensor_split);
         // add CPU buffer types as a fallback
@@ -1485,6 +1488,24 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
     pimpl->mappings.reserve(ml.mappings.size());
 
+    // Create SSD manager early (before buffer allocation) so we can prevent
+    // RAM allocation for expert tensors by setting their data pointers
+    if (params.use_ssd_offload && hparams.n_expert > 0 && !ssd_manager) {
+        ssd_manager = std::make_unique<llama_ssd_manager>();
+        LLAMA_LOG_INFO("%s: SSD offloading enabled for MoE expert weights (n_expert=%d, n_expert_used=%d)\n",
+            __func__, hparams.n_expert, hparams.n_expert_used);
+
+        // Scan all contexts to identify SSD tensors
+        ggml_backend_buffer_type_t ssd_buft = nullptr;
+        for (auto & [buft, ctx_ptr] : ml.ctx_map) {
+            ssd_manager->pre_alloc_scan(ctx_ptr.get());
+            if (!ssd_buft) ssd_buft = buft; // use the first buft for the dummy buffer
+        }
+
+        // Allocate double buffers and set tensor->data pointers so the allocator skips them
+        ssd_manager->finalize_layout(ssd_buft);
+    }
+
     // create the backend buffers
     std::vector<std::pair<ggml_context *, llama_buf_map>> ctx_buf_maps;
     ctx_buf_maps.reserve(ml.ctx_map.size());
@@ -1551,6 +1572,18 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft); // real buffer
             }
             if (buf == nullptr) {
+                // If SSD offloading is active, all tensors in this context may already
+                // have data pointers set (SSD-managed), so no buffer is needed.
+                if (ssd_manager) {
+                    bool all_ssd = true;
+                    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+                        if (t->data == nullptr) { all_ssd = false; break; }
+                    }
+                    if (all_ssd) {
+                        // All tensors are SSD-managed, skip buffer allocation
+                        continue;
+                    }
+                }
                 throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));
             }
             if (use_mlock && ggml_backend_buffer_is_host(buf)) {
@@ -1606,9 +1639,14 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     // load tensor data
     for (auto & [ctx, buf_map] : ctx_buf_maps) {
-        if (!ml.load_all_data(ctx, buf_map, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
+        if (!ml.load_all_data(ctx, buf_map, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data, ssd_manager.get())) {
             return false;
         }
+    }
+
+    // Initialize SSD manager after all tensors are registered
+    if (ssd_manager) {
+        ssd_manager->init(ml.file_paths);
     }
 
     if (use_mmap_buffer) {
@@ -2275,6 +2313,7 @@ llama_model_params llama_model_default_params() {
         /*.use_extra_bufts             =*/ true,
         /*.no_host                     =*/ false,
         /*.no_alloc                    =*/ false,
+        /*.use_ssd_offload             =*/ false,
     };
 
     return result;
