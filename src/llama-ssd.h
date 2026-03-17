@@ -12,7 +12,6 @@
 #include <unordered_set>
 #include <vector>
 
-struct llama_file;
 class llama_io_uring;
 
 // Metadata for a single expert slice within a 3D expert tensor
@@ -107,6 +106,9 @@ private:
     // Submit async read for a specific expert slice, returns ticket
     uint64_t load_expert_async(int layer_idx, int tensor_idx, int expert_idx, int buf_idx);
 
+    // Get the file descriptor to use for reads (O_DIRECT if available, else regular)
+    int get_read_fd(uint16_t file_idx) const;
+
     std::vector<ssd_layer_info> layers;
 
     // Double buffers
@@ -135,8 +137,12 @@ private:
     };
     std::unordered_map<uint64_t, async_read_info> in_flight;
 
-    // Own file handles (opened independently from model loader)
-    std::vector<std::unique_ptr<llama_file>> files_;
+    // File descriptors for expert data reading
+    // Direct I/O fds (O_DIRECT) for aligned reads, regular fds as fallback
+    std::vector<int> dio_fds;     // O_DIRECT file descriptors (-1 if not available)
+    std::vector<int> reg_fds;     // regular file descriptors (fallback)
+    size_t dio_alignment = 4096;  // O_DIRECT alignment requirement
+    bool use_direct_io = false;   // whether O_DIRECT is active
 
     // Mapping from tensor name to (layer_idx, tensor_idx) for fast lookup
     struct tensor_loc {

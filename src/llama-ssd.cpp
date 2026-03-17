@@ -1,6 +1,5 @@
 #include "llama-ssd.h"
 #include "llama-iouring.h"
-#include "llama-mmap.h"
 #include "llama-impl.h"
 
 #include <algorithm>
@@ -10,9 +9,20 @@
 #include <stdexcept>
 #include <unistd.h>
 
+#ifdef __linux__
+#include <fcntl.h>
+#include <sys/stat.h>
+#endif
+
 llama_ssd_manager::llama_ssd_manager() = default;
 
 llama_ssd_manager::~llama_ssd_manager() {
+    for (int fd : dio_fds) {
+        if (fd >= 0) close(fd);
+    }
+    for (int fd : reg_fds) {
+        if (fd >= 0) close(fd);
+    }
     if (dummy_buf) {
         ggml_backend_buffer_free(dummy_buf);
         dummy_buf = nullptr;
@@ -186,9 +196,65 @@ void llama_ssd_manager::register_tensor(ggml_tensor * tensor, uint16_t file_idx,
 void llama_ssd_manager::init(const std::vector<std::string> & file_paths) {
     GGML_ASSERT(!initialized);
 
-    // Open own file handles for reading expert data
+    // Open file descriptors for reading expert data
+    // Try O_DIRECT first for each file, fall back to regular fd
+    use_direct_io = true;
     for (const auto & path : file_paths) {
-        files_.emplace_back(new llama_file(path.c_str(), "rb"));
+        int dio_fd = -1;
+        int reg_fd = -1;
+
+#ifdef __linux__
+        dio_fd = open(path.c_str(), O_RDONLY | O_DIRECT);
+        if (dio_fd >= 0) {
+            // O_DIRECT requires alignment to logical block size (typically 512 or 4096),
+            // NOT st_blksize which returns the optimal I/O size (can be very large on RAID)
+            // Use 4096 as a safe default that works on all modern Linux filesystems
+            dio_alignment = 4096;
+        } else {
+            use_direct_io = false;
+        }
+#else
+        use_direct_io = false;
+#endif
+        // Always open a regular fd as fallback for unaligned reads
+        reg_fd = open(path.c_str(), O_RDONLY);
+        if (reg_fd < 0) {
+            throw std::runtime_error("Failed to open model file: " + path);
+        }
+
+        dio_fds.push_back(dio_fd);
+        reg_fds.push_back(reg_fd);
+    }
+
+    // O_DIRECT requires aligned offsets and sizes. Expert slice sizes are typically
+    // aligned (quantized blocks), but file offsets depend on GGUF header layout.
+    // We handle unaligned offsets by reading aligned chunks into a bounce buffer.
+    if (use_direct_io) {
+        // Check if sizes are aligned (offsets handled at read time)
+        bool sizes_aligned = true;
+        for (const auto & layer : layers) {
+            for (const auto & ti : layer.tensors) {
+                for (const auto & slice : ti.experts) {
+                    if (slice.slice_size % dio_alignment != 0) {
+                        sizes_aligned = false;
+                        break;
+                    }
+                }
+                if (!sizes_aligned) break;
+            }
+            if (!sizes_aligned) break;
+        }
+        if (!sizes_aligned) {
+            LLAMA_LOG_WARN("%s: expert slice sizes not aligned to %zu bytes, disabling O_DIRECT\n",
+                __func__, dio_alignment);
+            use_direct_io = false;
+            for (int fd : dio_fds) {
+                if (fd >= 0) close(fd);
+            }
+            dio_fds.assign(dio_fds.size(), -1);
+        } else {
+            LLAMA_LOG_INFO("%s: O_DIRECT enabled, alignment=%zu\n", __func__, dio_alignment);
+        }
     }
 
     // Create io_uring instance for async I/O
@@ -196,9 +262,17 @@ void llama_ssd_manager::init(const std::vector<std::string> & file_paths) {
 
     initialized = true;
 
-    LLAMA_LOG_INFO("%s: SSD offloading initialized, %zu layers, buffer size %.1f MB x2, async=%s\n",
+    LLAMA_LOG_INFO("%s: SSD offloading initialized, %zu layers, buffer size %.1f MB x2, async=%s, direct_io=%s\n",
         __func__, layers.size(), (double)buf_size / (1024.0 * 1024.0),
-        io->is_async() ? "io_uring" : "sync");
+        io->is_async() ? "io_uring" : "sync",
+        use_direct_io ? "on" : "off");
+}
+
+int llama_ssd_manager::get_read_fd(uint16_t file_idx) const {
+    if (use_direct_io && file_idx < dio_fds.size() && dio_fds[file_idx] >= 0) {
+        return dio_fds[file_idx];
+    }
+    return reg_fds[file_idx];
 }
 
 void llama_ssd_manager::load_expert_sync(int layer_idx, int tensor_idx, int expert_idx, int buf_idx) {
@@ -207,9 +281,42 @@ void llama_ssd_manager::load_expert_sync(int layer_idx, int tensor_idx, int expe
 
     uint8_t * dest = (uint8_t *)buffers[buf_idx] + ti.tensor_offset + expert_idx * slice.slice_size;
 
-    llama_file * file = files_[slice.file_idx].get();
-    file->seek(slice.file_offset, SEEK_SET);
-    file->read_raw(dest, slice.slice_size);
+    if (use_direct_io && dio_fds[slice.file_idx] >= 0) {
+        // O_DIRECT path: handle potentially unaligned offset
+        size_t offset_misalign = slice.file_offset % dio_alignment;
+        off_t  aligned_offset  = (off_t)(slice.file_offset - offset_misalign);
+        size_t aligned_size    = ((slice.slice_size + offset_misalign + dio_alignment - 1) / dio_alignment) * dio_alignment;
+
+        if (offset_misalign == 0) {
+            // Offset and size are both aligned — read directly into dest
+            ssize_t ret = pread(dio_fds[slice.file_idx], dest, slice.slice_size, aligned_offset);
+            if (ret < 0 || (size_t)ret != slice.slice_size) {
+                LLAMA_LOG_ERROR("%s: O_DIRECT pread failed: ret=%zd, errno=%s\n", __func__, ret, strerror(errno));
+            }
+        } else {
+            // Offset is unaligned — read into aligned bounce buffer, then copy
+            thread_local void * bounce_ptr = nullptr;
+            thread_local size_t bounce_cap = 0;
+            if (bounce_cap < aligned_size) {
+                if (bounce_ptr) free(bounce_ptr);
+                posix_memalign(&bounce_ptr, dio_alignment, aligned_size);
+                bounce_cap = aligned_size;
+            }
+
+            ssize_t ret = pread(dio_fds[slice.file_idx], bounce_ptr, aligned_size, aligned_offset);
+            if (ret < 0 || (size_t)ret < slice.slice_size + offset_misalign) {
+                LLAMA_LOG_ERROR("%s: O_DIRECT bounce pread failed: ret=%zd, errno=%s\n", __func__, ret, strerror(errno));
+            } else {
+                memcpy(dest, (uint8_t *)bounce_ptr + offset_misalign, slice.slice_size);
+            }
+        }
+    } else {
+        // Regular pread path
+        ssize_t ret = pread(reg_fds[slice.file_idx], dest, slice.slice_size, (off_t)slice.file_offset);
+        if (ret < 0 || (size_t)ret != slice.slice_size) {
+            LLAMA_LOG_ERROR("%s: pread failed: ret=%zd, errno=%s\n", __func__, ret, strerror(errno));
+        }
+    }
 
     stats_.n_loads++;
     stats_.bytes_loaded += slice.slice_size;
@@ -221,7 +328,16 @@ uint64_t llama_ssd_manager::load_expert_async(int layer_idx, int tensor_idx, int
 
     uint8_t * dest = (uint8_t *)buffers[buf_idx] + ti.tensor_offset + expert_idx * slice.slice_size;
 
-    int fd = files_[slice.file_idx]->file_id();
+    // For async reads with O_DIRECT and unaligned offsets, use the regular fd
+    // (io_uring with O_DIRECT requires aligned offsets; bounce buffer approach
+    // doesn't work well with async since we'd need to track the bounce buffer)
+    int fd;
+    if (use_direct_io && dio_fds[slice.file_idx] >= 0 && slice.file_offset % dio_alignment == 0) {
+        fd = dio_fds[slice.file_idx];
+    } else {
+        fd = reg_fds[slice.file_idx];
+    }
+
     uint64_t ticket = io->submit_read(fd, dest, slice.slice_size, (off_t)slice.file_offset);
 
     in_flight[ticket] = {layer_idx, tensor_idx, expert_idx, buf_idx};
