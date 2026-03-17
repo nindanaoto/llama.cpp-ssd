@@ -991,6 +991,7 @@ struct llama_model::impl {
     std::vector<std::pair<ggml_context_ptr, std::vector<ggml_backend_buffer_ptr>>> ctxs_bufs;
 
     buft_list_t cpu_buft_list;
+    buft_list_t cpu_buft_list_no_repack; // for SSD-offloaded tensors that can't use CPU_REPACK
     std::map<ggml_backend_dev_t, buft_list_t> gpu_buft_list;
 
     struct layer_dev {
@@ -1221,11 +1222,11 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     LLAMA_LOG_INFO("%s: loading model tensors, this can take a while... (mmap = %s, direct_io = %s)\n",
         __func__, ml.use_mmap ? "true" : "false", ml.use_direct_io ? "true" : "false");
 
-    // build a list of buffer types for the CPU and GPU devices
-    // Disable extra buffer types (CPU_REPACK) when SSD offloading is active,
-    // since weight repacking conflicts with dynamic data pointer redirection
-    bool use_extra = params.use_extra_bufts && !(params.use_ssd_offload && hparams.n_expert > 0);
-    pimpl->cpu_buft_list = make_cpu_buft_list(devices, use_extra, params.no_host);
+    pimpl->cpu_buft_list = make_cpu_buft_list(devices, params.use_extra_bufts, params.no_host);
+    // SSD-offloaded expert tensors cannot use CPU_REPACK (data pointers are redirected at runtime)
+    if (params.use_ssd_offload && hparams.n_expert > 0) {
+        pimpl->cpu_buft_list_no_repack = make_cpu_buft_list(devices, false, params.no_host);
+    }
     for (const auto & dev : devices) {
         buft_list_t buft_list = make_gpu_buft_list(dev.dev, split_mode, tensor_split);
         // add CPU buffer types as a fallback
@@ -1660,8 +1661,18 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
 ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
     const buft_list_t * buft_list_layer = tn.bid == -1 ? nullptr : pimpl->dev_layer.at(tn.bid).buft_list;
+    const buft_list_t * cpu_list = &pimpl->cpu_buft_list;
+
+    // SSD-offloaded expert tensors must not use CPU_REPACK because their data
+    // pointers are redirected at runtime.
+    if (params.use_ssd_offload && !pimpl->cpu_buft_list_no_repack.empty() &&
+            llama_ssd_manager::is_expert_weight(tn.str().c_str())) {
+        cpu_list = &pimpl->cpu_buft_list_no_repack;
+        buft_list_layer = cpu_list;
+    }
+
     return ml.create_tensor(
-        hparams, &pimpl->cpu_buft_list, pimpl->dev_input.buft_list, pimpl->dev_output.buft_list, buft_list_layer,
+        hparams, cpu_list, pimpl->dev_input.buft_list, pimpl->dev_output.buft_list, buft_list_layer,
         tn, ne, flags);
 }
 
