@@ -94,6 +94,8 @@ public:
         uint64_t n_prefetch_misses = 0;
         uint64_t n_loads = 0;
         uint64_t bytes_loaded = 0;
+        double   t_io_us = 0;          // total I/O time (sync loads only)
+        double   t_wait_us = 0;        // total time waiting for async completions
     };
     stats get_stats() const { return stats_; }
     void  reset_stats() { stats_ = {}; }
@@ -116,6 +118,10 @@ private:
 
     // Prediction state: last-used experts per layer
     std::vector<std::vector<int>> last_selected; // [layer_idx] -> expert indices
+
+    // Track which buffer the last prefetch targeted and for which layer
+    int prefetch_target_buf = -1;
+    int prefetch_target_layer = -1;
 
     // Dummy buffer for SSD tensors (so backend scheduler doesn't try to allocate them)
     ggml_backend_buffer_t dummy_buf = nullptr;

@@ -4156,10 +4156,12 @@ void llama_perf_context_print(const llama_context * ctx) {
         auto ssd_stats = ctx->get_model().ssd_manager->get_stats();
         uint64_t total = ssd_stats.n_prefetch_hits + ssd_stats.n_prefetch_misses;
         double hit_rate = total > 0 ? 100.0 * ssd_stats.n_prefetch_hits / total : 0.0;
-        LLAMA_LOG_INFO("%s:     SSD offload: %lu loads, %.1f MB read, hit rate %.1f%% (%lu/%lu)\n",
+        double bw_mbps = ssd_stats.t_io_us > 0 ? ssd_stats.bytes_loaded / ssd_stats.t_io_us : 0.0;
+        LLAMA_LOG_INFO("%s:     SSD offload: %lu loads, %.1f MB read, hit rate %.1f%% (%lu/%lu), sync I/O %.1f ms, wait %.1f ms, BW %.0f MB/s\n",
             __func__, (unsigned long)ssd_stats.n_loads,
             (double)ssd_stats.bytes_loaded / (1024.0 * 1024.0),
-            hit_rate, (unsigned long)ssd_stats.n_prefetch_hits, (unsigned long)total);
+            hit_rate, (unsigned long)ssd_stats.n_prefetch_hits, (unsigned long)total,
+            ssd_stats.t_io_us / 1000.0, ssd_stats.t_wait_us / 1000.0, bw_mbps);
     }
 }
 

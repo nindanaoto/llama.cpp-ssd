@@ -235,12 +235,22 @@ uint64_t llama_ssd_manager::load_expert_async(int layer_idx, int tensor_idx, int
 void llama_ssd_manager::ensure_ready(int il, const int32_t * selected_experts, int n_selected) {
     if (il < 0 || il >= (int)layers.size()) return;
 
+    // Determine which buffer to use for this layer.
+    // If prefetch targeted this layer, swap to the prefetched buffer.
+    int use_buf;
+    if (prefetch_target_layer == il && prefetch_target_buf >= 0) {
+        use_buf = prefetch_target_buf;
+        active_buf = use_buf;
+        prefetch_target_layer = -1;
+        prefetch_target_buf = -1;
+    } else {
+        use_buf = active_buf;
+    }
+
     const auto & layer = layers[il];
-    auto & bs = buf_states[active_buf];
+    auto & bs = buf_states[use_buf];
 
-    bool same_layer = (bs.layer_idx == il);
-
-    if (!same_layer) {
+    if (bs.layer_idx != il) {
         bs.layer_idx = il;
         bs.expert_loaded.resize(layer.tensors.size());
         for (size_t t = 0; t < layer.tensors.size(); t++) {
@@ -248,8 +258,7 @@ void llama_ssd_manager::ensure_ready(int il, const int32_t * selected_experts, i
         }
     }
 
-    // First: wait for any in-flight async reads that target this layer+buffer
-    // and mark them as loaded
+    // Reap any completed async reads and mark experts as loaded
     if (!in_flight.empty()) {
         std::vector<uint64_t> completed;
         io->reap_completed(completed);
@@ -257,7 +266,7 @@ void llama_ssd_manager::ensure_ready(int il, const int32_t * selected_experts, i
             auto it = in_flight.find(ticket);
             if (it != in_flight.end()) {
                 auto & info = it->second;
-                if (info.buf_idx == active_buf && info.layer_idx == il) {
+                if (info.buf_idx == use_buf && info.layer_idx == il) {
                     bs.expert_loaded[info.tensor_idx][info.expert_idx] = true;
                 }
                 in_flight.erase(it);
@@ -265,9 +274,10 @@ void llama_ssd_manager::ensure_ready(int il, const int32_t * selected_experts, i
         }
 
         // Wait for remaining in-flight reads targeting this layer+buffer
+        int64_t t0 = ggml_time_us();
         std::vector<uint64_t> to_wait;
         for (auto & [ticket, info] : in_flight) {
-            if (info.buf_idx == active_buf && info.layer_idx == il) {
+            if (info.buf_idx == use_buf && info.layer_idx == il) {
                 to_wait.push_back(ticket);
             }
         }
@@ -280,9 +290,12 @@ void llama_ssd_manager::ensure_ready(int il, const int32_t * selected_experts, i
                 in_flight.erase(it);
             }
         }
+        if (!to_wait.empty()) {
+            stats_.t_wait_us += (double)(ggml_time_us() - t0);
+        }
     }
 
-    // Load any missing expert slices (synchronous — these are mispredictions)
+    // Load any missing expert slices synchronously (mispredictions)
     for (int s = 0; s < n_selected; s++) {
         int expert_idx = selected_experts[s];
         for (size_t t = 0; t < layer.tensors.size(); t++) {
@@ -292,7 +305,9 @@ void llama_ssd_manager::ensure_ready(int il, const int32_t * selected_experts, i
                 continue;
             }
             stats_.n_prefetch_misses++;
-            load_expert_sync(il, (int)t, expert_idx, active_buf);
+            int64_t t0 = ggml_time_us();
+            load_expert_sync(il, (int)t, expert_idx, use_buf);
+            stats_.t_io_us += (double)(ggml_time_us() - t0);
             bs.expert_loaded[t][expert_idx] = true;
         }
     }
@@ -324,12 +339,15 @@ void llama_ssd_manager::prefetch_start(int il) {
         bs.expert_loaded[t].assign(layer.tensors[t].n_expert, false);
     }
 
+    // Record prefetch target so ensure_ready knows which buffer to use
+    prefetch_target_buf = next_buf;
+    prefetch_target_layer = il;
+
     // Submit async reads for predicted experts (non-blocking)
     for (int expert_idx : predicted) {
         for (size_t t = 0; t < layer.tensors.size(); t++) {
             if (expert_idx < 0 || expert_idx >= layer.tensors[t].n_expert) continue;
             load_expert_async(il, (int)t, expert_idx, next_buf);
-            // Don't mark as loaded yet — will be confirmed in ensure_ready
         }
     }
 }
