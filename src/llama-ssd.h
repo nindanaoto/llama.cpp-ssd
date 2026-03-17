@@ -13,6 +13,7 @@
 #include <vector>
 
 struct llama_file;
+class llama_io_uring;
 
 // Metadata for a single expert slice within a 3D expert tensor
 struct ssd_expert_slice {
@@ -98,8 +99,11 @@ public:
     void  reset_stats() { stats_ = {}; }
 
 private:
-    // Load a specific expert slice synchronously via pread
+    // Load a specific expert slice synchronously (blocking)
     void load_expert_sync(int layer_idx, int tensor_idx, int expert_idx, int buf_idx);
+
+    // Submit async read for a specific expert slice, returns ticket
+    uint64_t load_expert_async(int layer_idx, int tensor_idx, int expert_idx, int buf_idx);
 
     std::vector<ssd_layer_info> layers;
 
@@ -115,6 +119,15 @@ private:
 
     // Dummy buffer for SSD tensors (so backend scheduler doesn't try to allocate them)
     ggml_backend_buffer_t dummy_buf = nullptr;
+
+    // Async I/O engine
+    std::unique_ptr<llama_io_uring> io;
+
+    // Track in-flight async reads: ticket -> {layer_idx, tensor_idx, expert_idx, buf_idx}
+    struct async_read_info {
+        int layer_idx, tensor_idx, expert_idx, buf_idx;
+    };
+    std::unordered_map<uint64_t, async_read_info> in_flight;
 
     // Own file handles (opened independently from model loader)
     std::vector<std::unique_ptr<llama_file>> files_;

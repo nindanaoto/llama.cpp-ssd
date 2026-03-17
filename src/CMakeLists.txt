@@ -31,6 +31,7 @@ add_library(llama
             llama-memory-recurrent.cpp
             llama-mmap.cpp
             llama-ssd.cpp
+            llama-iouring.cpp
             llama-model-loader.cpp
             llama-model-saver.cpp
             llama-model.cpp
@@ -54,6 +55,22 @@ target_include_directories(llama PUBLIC ../include)
 target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
 
 target_link_libraries(llama PUBLIC ggml)
+
+# io_uring support for SSD offloading (Linux only)
+if (UNIX AND NOT APPLE)
+    find_package(PkgConfig QUIET)
+    if (PkgConfig_FOUND)
+        pkg_check_modules(URING QUIET liburing)
+    endif()
+    if (URING_FOUND)
+        message(STATUS "liburing found: ${URING_VERSION}")
+        target_compile_definitions(llama PRIVATE LLAMA_IO_URING)
+        target_link_libraries(llama PRIVATE ${URING_LIBRARIES})
+        target_include_directories(llama PRIVATE ${URING_INCLUDE_DIRS})
+    else()
+        message(STATUS "liburing not found, SSD offloading will use synchronous I/O")
+    endif()
+endif()
 
 if (BUILD_SHARED_LIBS)
     set_target_properties(llama PROPERTIES POSITION_INDEPENDENT_CODE ON)
