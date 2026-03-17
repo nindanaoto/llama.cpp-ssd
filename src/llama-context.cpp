@@ -1344,8 +1344,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             auto original_cb = cparams.cb_eval;
             auto original_ud = cparams.cb_eval_user_data;
 
-            // Prefetch experts for layer 0 before graph compute starts
-            ssd_mgr->prefetch_start(0);
+            // Prefetch layer 0 experts only if no prefetch is already pending
+            // (the wraparound from the last token's final layer already prefetches layer 0)
+            if (ssd_mgr->get_prefetch_target_layer() != 0) {
+                ssd_mgr->prefetch_start(0);
+            }
 
             auto ssd_cb = [ssd_mgr, original_cb, original_ud](struct ggml_tensor * t, bool ask, void * /*ud*/) -> bool {
                 const char * name = ggml_get_name(t);
@@ -1377,9 +1380,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                     // Update prediction state
                     ssd_mgr->update_prediction(il, selected, n_selected);
 
-                    // Start speculative prefetch for next layer
+                    // Start speculative prefetch for next layer,
+                    // or wrap around to layer 0 for the next token
                     if (il + 1 < ssd_mgr->n_layers()) {
                         ssd_mgr->prefetch_start(il + 1);
+                    } else {
+                        // Last MoE layer: prefetch layer 0 for the next token
+                        ssd_mgr->prefetch_start(0);
                     }
                 }
 

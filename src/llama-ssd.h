@@ -87,6 +87,9 @@ public:
     // Get number of registered layers
     int n_layers() const { return (int)layers.size(); }
 
+    // Get which layer the pending prefetch targets (-1 if none)
+    int get_prefetch_target_layer() const { return prefetch_target_layer; }
+
     // Statistics
     struct stats {
         uint64_t n_prefetch_hits = 0;
