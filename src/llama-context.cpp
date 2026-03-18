@@ -1338,8 +1338,54 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         ggml_backend_sched_reset(sched.get());
 
-        // No callback for SSD offloading — use preload-all mode
-        ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+        if (model.ssd_manager) {
+            // Install lightweight SSD callback for per-layer tensor swap.
+            // Prefetch is non-blocking — data is already loaded via io_uring
+            // from the previous layer's callback.
+            auto * ssd_mgr = model.ssd_manager.get();
+            auto original_cb = cparams.cb_eval;
+            auto original_ud = cparams.cb_eval_user_data;
+
+            // Kick off prefetch for layer 0 before graph starts
+            if (ssd_mgr->get_prefetch_target_layer() != 0) {
+                ssd_mgr->prefetch_start(0);
+            }
+
+            auto ssd_cb = [ssd_mgr, original_cb, original_ud](struct ggml_tensor * t, bool ask, void * /*ud*/) -> bool {
+                const char * name = ggml_get_name(t);
+
+                if (ask) {
+                    if (strncmp(name, "ffn_moe_topk-", 13) == 0) {
+                        return true;
+                    }
+                    if (original_cb) return original_cb(t, ask, original_ud);
+                    return false;
+                }
+
+                // Node computed — swap expert data and prefetch next layer
+                if (strncmp(name, "ffn_moe_topk-", 13) == 0) {
+                    int il = atoi(name + 13);
+                    const int32_t * selected = (const int32_t *)t->data;
+                    int n_selected = (int)t->ne[0];
+
+                    ssd_mgr->ensure_ready(il, selected, n_selected);
+                    ssd_mgr->activate_layer(il);
+                    ssd_mgr->update_prediction(il, selected, n_selected);
+
+                    // Prefetch next layer (wraps around for next token)
+                    int next = (il + 1 < ssd_mgr->n_layers()) ? il + 1 : 0;
+                    ssd_mgr->prefetch_start(next);
+                }
+
+                if (original_cb) return original_cb(t, ask, original_ud);
+                return true;
+            };
+
+            ssd_cb_wrapper::fn = std::move(ssd_cb);
+            ggml_backend_sched_set_eval_callback(sched.get(), ssd_cb_wrapper::call, nullptr);
+        } else {
+            ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+        }
 
         gf = model.build_graph(gparams);
 
@@ -1354,11 +1400,6 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
         }
-
-        // SSD offloading: scan graph for topk tensors (for post-compute prediction update)
-        if (model.ssd_manager) {
-            model.ssd_manager->scan_graph_for_topk(gf);
-        }
     }
 
     // set the input data for the input tensors
@@ -1368,44 +1409,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
-    // SSD offloading: preload ALL layers' predicted experts before graph compute.
-    // Uses io_uring to submit all reads in parallel, waits for completion,
-    // then runs graph with NO callback for full multi-thread parallelism.
-    // On misprediction, reload correct experts and recompute.
-    if (model.ssd_manager) {
-        model.ssd_manager->preload_all_layers();
-    }
-
-    {
-        const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
-        if (status != GGML_STATUS_SUCCESS) {
-            LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
-            ret = status;
-            return nullptr;
-        }
-    }
-
-    // SSD offloading: check predictions and recompute if needed
-    if (model.ssd_manager) {
-        bool mismatch = model.ssd_manager->update_predictions_from_graph();
-        if (mismatch) {
-            // Predictions were wrong — reload with correct experts and recompute
-            LLAMA_LOG_DEBUG("%s: SSD misprediction detected, recomputing\n", __func__);
-            model.ssd_manager->preload_all_layers();
-
-            // Re-set inputs before recompute (graph state may be stale)
-            res->set_inputs(&ubatch);
-
-            const auto status2 = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
-            if (status2 != GGML_STATUS_SUCCESS) {
-                LLAMA_LOG_ERROR("%s: failed to recompute graph, status: %d\n", __func__, status2);
-                ret = status2;
-                return nullptr;
-            }
-
-            // Update predictions again (should match now)
-            model.ssd_manager->update_predictions_from_graph();
-        }
+    const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    if (status != GGML_STATUS_SUCCESS) {
+        LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
+        ret = status;
+        return nullptr;
     }
 
     ret = GGML_STATUS_SUCCESS;
