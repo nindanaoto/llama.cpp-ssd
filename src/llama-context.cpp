@@ -1347,9 +1347,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             auto original_ud = cparams.cb_eval_user_data;
 
             // Kick off prefetch for layer 0 before graph starts
-            if (ssd_mgr->get_prefetch_target_layer() != 0) {
-                ssd_mgr->prefetch_start(0);
-            }
+            ssd_mgr->prefetch_start(0);
 
             auto ssd_cb = [ssd_mgr, original_cb, original_ud](struct ggml_tensor * t, bool ask, void * /*ud*/) -> bool {
                 const char * name = ggml_get_name(t);
@@ -1372,7 +1370,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                     ssd_mgr->activate_layer(il);
                     ssd_mgr->update_prediction(il, selected, n_selected);
 
-                    // Prefetch next layer (wraps around for next token)
+                    // Prefetch next layer into the other buffer slot
                     int next = (il + 1 < ssd_mgr->n_layers()) ? il + 1 : 0;
                     ssd_mgr->prefetch_start(next);
                 }

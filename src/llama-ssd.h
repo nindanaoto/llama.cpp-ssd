@@ -129,12 +129,14 @@ private:
 
     std::vector<ssd_layer_info> layers;
 
-    // Double buffers
-    void * buffers[2] = {nullptr, nullptr};
-    size_t buf_size = 0;
-    int    active_buf = 0; // which buffer is currently used for compute (0 or 1)
+    // Circular buffer: N slots, each holding one layer's expert data.
+    // Layer il maps to slot (il % n_buf_slots).
+    // With N=3: layer N computes from slot N%3, while layers N+1 and N+2 prefetch.
+    static constexpr int N_BUF_SLOTS = 2;
+    void * buffers[N_BUF_SLOTS] = {};
+    size_t buf_size = 0; // size of each slot
 
-    ssd_buf_state buf_states[2];
+    ssd_buf_state buf_states[N_BUF_SLOTS];
 
     // Prediction state: last-used experts per layer
     std::vector<std::vector<int>> last_selected; // [layer_idx] -> expert indices

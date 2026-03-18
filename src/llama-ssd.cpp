@@ -27,7 +27,7 @@ llama_ssd_manager::~llama_ssd_manager() {
         ggml_backend_buffer_free(dummy_buf);
         dummy_buf = nullptr;
     }
-    for (int i = 0; i < 2; i++) {
+    for (int i = 0; i < N_BUF_SLOTS; i++) {
         if (buffers[i]) {
             free(buffers[i]);
             buffers[i] = nullptr;
@@ -113,20 +113,20 @@ void llama_ssd_manager::finalize_layout(ggml_backend_buffer_type_t buft) {
 
     buf_size = max_layer_bytes;
 
-    // Allocate double buffers with page alignment for potential O_DIRECT
+    // Allocate circular buffer slots with page alignment for O_DIRECT
     size_t alignment = 4096;
-    for (int i = 0; i < 2; i++) {
+    for (int i = 0; i < N_BUF_SLOTS; i++) {
         int ret = posix_memalign(&buffers[i], alignment, buf_size);
         if (ret != 0 || !buffers[i]) {
-            LLAMA_LOG_ERROR("%s: failed to allocate SSD buffer %d (%.1f MB)\n",
+            LLAMA_LOG_ERROR("%s: failed to allocate SSD buffer slot %d (%.1f MB)\n",
                 __func__, i, (double)buf_size / (1024.0 * 1024.0));
-            throw std::runtime_error("Failed to allocate SSD double buffer");
+            throw std::runtime_error("Failed to allocate SSD circular buffer");
         }
         memset(buffers[i], 0, buf_size);
     }
 
     // Initialize buffer states
-    for (int b = 0; b < 2; b++) {
+    for (int b = 0; b < N_BUF_SLOTS; b++) {
         buf_states[b].layer_idx = -1;
         buf_states[b].expert_loaded.clear();
     }
@@ -351,17 +351,8 @@ uint64_t llama_ssd_manager::load_expert_async(int layer_idx, int tensor_idx, int
 void llama_ssd_manager::ensure_ready(int il, const int32_t * selected_experts, int n_selected) {
     if (il < 0 || il >= (int)layers.size()) return;
 
-    // Determine which buffer to use for this layer.
-    // If prefetch targeted this layer, swap to the prefetched buffer.
-    int use_buf;
-    if (prefetch_target_layer == il && prefetch_target_buf >= 0) {
-        use_buf = prefetch_target_buf;
-        active_buf = use_buf;
-        prefetch_target_layer = -1;
-        prefetch_target_buf = -1;
-    } else {
-        use_buf = active_buf;
-    }
+    // Circular buffer: layer il maps to slot (il % N_BUF_SLOTS)
+    int use_buf = il % N_BUF_SLOTS;
 
     const auto & layer = layers[il];
     auto & bs = buf_states[use_buf];
@@ -432,22 +423,23 @@ void llama_ssd_manager::ensure_ready(int il, const int32_t * selected_experts, i
 void llama_ssd_manager::activate_layer(int il) {
     if (il < 0 || il >= (int)layers.size()) return;
 
+    int buf_idx = il % N_BUF_SLOTS;
     const auto & layer = layers[il];
 
     for (const auto & ti : layer.tensors) {
-        ti.tensor->data = (uint8_t *)buffers[active_buf] + ti.tensor_offset;
+        ti.tensor->data = (uint8_t *)buffers[buf_idx] + ti.tensor_offset;
     }
 }
 
 void llama_ssd_manager::prefetch_start(int il) {
     if (il < 0 || il >= (int)layers.size()) return;
 
-    int next_buf = 1 - active_buf;
+    int buf_idx = il % N_BUF_SLOTS;
     auto predicted = predict_experts(il);
     if (predicted.empty()) return;
 
     const auto & layer = layers[il];
-    auto & bs = buf_states[next_buf];
+    auto & bs = buf_states[buf_idx];
 
     bs.layer_idx = il;
     bs.expert_loaded.resize(layer.tensors.size());
@@ -455,15 +447,14 @@ void llama_ssd_manager::prefetch_start(int il) {
         bs.expert_loaded[t].assign(layer.tensors[t].n_expert, false);
     }
 
-    // Record prefetch target so ensure_ready knows which buffer to use
-    prefetch_target_buf = next_buf;
+    prefetch_target_buf = buf_idx;
     prefetch_target_layer = il;
 
     // Submit async reads for predicted experts (non-blocking)
     for (int expert_idx : predicted) {
         for (size_t t = 0; t < layer.tensors.size(); t++) {
             if (expert_idx < 0 || expert_idx >= layer.tensors[t].n_expert) continue;
-            load_expert_async(il, (int)t, expert_idx, next_buf);
+            load_expert_async(il, (int)t, expert_idx, buf_idx);
         }
     }
 }
@@ -482,69 +473,9 @@ void llama_ssd_manager::update_prediction(int il, const int32_t * selected_exper
 }
 
 void llama_ssd_manager::preload_all_layers() {
-    int64_t t0 = ggml_time_us();
-
-    // Use buffer 0 for all layers
-    int buf_idx = 0;
-    active_buf = buf_idx;
-    prefetch_target_buf = -1;
-    prefetch_target_layer = -1;
-
-    // Phase 1: Submit ALL expert reads via io_uring (non-blocking)
-    for (int il = 0; il < (int)layers.size(); il++) {
-        auto predicted = predict_experts(il);
-        if (predicted.empty()) continue;
-
-        const auto & layer = layers[il];
-
-        for (int expert_idx : predicted) {
-            for (size_t t = 0; t < layer.tensors.size(); t++) {
-                if (expert_idx < 0 || expert_idx >= layer.tensors[t].n_expert) continue;
-                load_expert_async(il, (int)t, expert_idx, buf_idx);
-            }
-        }
-    }
-
-    // Phase 2: Wait for ALL reads to complete
-    io->wait_all();
-
-    // Mark all loaded experts and clear in-flight tracking
-    for (auto & [ticket, info] : in_flight) {
-        auto & bs = buf_states[info.buf_idx];
-        if (bs.layer_idx == info.layer_idx) {
-            bs.expert_loaded[info.tensor_idx][info.expert_idx] = true;
-        }
-    }
-    in_flight.clear();
-
-    // Phase 3: Set tensor->data pointers for all layers
-    for (int il = 0; il < (int)layers.size(); il++) {
-        // Initialize buffer state for this layer
-        const auto & layer = layers[il];
-        auto & bs = buf_states[buf_idx];
-        bs.layer_idx = il;
-        bs.expert_loaded.resize(layer.tensors.size());
-        for (size_t t = 0; t < layer.tensors.size(); t++) {
-            bs.expert_loaded[t].assign(layer.tensors[t].n_expert, false);
-        }
-
-        // Mark predicted experts as loaded
-        auto predicted = predict_experts(il);
-        for (int expert_idx : predicted) {
-            for (size_t t = 0; t < layer.tensors.size(); t++) {
-                if (expert_idx >= 0 && expert_idx < layer.tensors[t].n_expert) {
-                    bs.expert_loaded[t][expert_idx] = true;
-                }
-            }
-        }
-
-        // Point tensor->data to buffer
-        for (const auto & ti : layer.tensors) {
-            ti.tensor->data = (uint8_t *)buffers[buf_idx] + ti.tensor_offset;
-        }
-    }
-
-    stats_.t_preload_us += (double)(ggml_time_us() - t0);
+    // Not used with circular buffer — kept for API compatibility.
+    // Use prefetch_start() with the callback instead.
+    (void)this;
 }
 
 void llama_ssd_manager::scan_graph_for_topk(struct ggml_cgraph * gf) {

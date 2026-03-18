@@ -1692,6 +1692,23 @@ bool llama_model_loader::load_all_data(
                     mapping->unmap_fragment(mmap_used.second, mapping->size());
                 }
             }
+
+            // SSD offloading: unmap expert tensor regions to release their physical pages.
+            // Non-expert tensors stay mmap'd for fast access from page cache.
+            if (ssd_manager) {
+                size_t total_unmapped = 0;
+                for (struct ggml_tensor * cur = ggml_get_first_tensor(ctx); cur != NULL; cur = ggml_get_next_tensor(ctx, cur)) {
+                    if (!llama_ssd_manager::is_expert_weight(ggml_get_name(cur))) continue;
+                    const auto * weight = get_weight(ggml_get_name(cur));
+                    if (!weight) continue;
+                    if (weight->idx < mappings.size()) {
+                        mappings.at(weight->idx)->unmap_fragment(weight->offs, weight->offs + ggml_nbytes(cur));
+                        total_unmapped += ggml_nbytes(cur);
+                    }
+                }
+                LLAMA_LOG_INFO("%s: SSD offloading: unmapped %.1f MB of expert data from mmap\n",
+                    __func__, (double)total_unmapped / (1024.0 * 1024.0));
+            }
         }
         if (progress_callback) {
             // Even though the model is done loading, we still honor
