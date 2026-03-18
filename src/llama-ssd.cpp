@@ -480,3 +480,117 @@ void llama_ssd_manager::update_prediction(int il, const int32_t * selected_exper
     if (il < 0 || il >= (int)last_selected.size()) return;
     last_selected[il].assign(selected_experts, selected_experts + n_selected);
 }
+
+void llama_ssd_manager::preload_all_layers() {
+    int64_t t0 = ggml_time_us();
+
+    // Use buffer 0 for all layers
+    int buf_idx = 0;
+    active_buf = buf_idx;
+    prefetch_target_buf = -1;
+    prefetch_target_layer = -1;
+
+    // Phase 1: Submit ALL expert reads via io_uring (non-blocking)
+    for (int il = 0; il < (int)layers.size(); il++) {
+        auto predicted = predict_experts(il);
+        if (predicted.empty()) continue;
+
+        const auto & layer = layers[il];
+
+        for (int expert_idx : predicted) {
+            for (size_t t = 0; t < layer.tensors.size(); t++) {
+                if (expert_idx < 0 || expert_idx >= layer.tensors[t].n_expert) continue;
+                load_expert_async(il, (int)t, expert_idx, buf_idx);
+            }
+        }
+    }
+
+    // Phase 2: Wait for ALL reads to complete
+    io->wait_all();
+
+    // Mark all loaded experts and clear in-flight tracking
+    for (auto & [ticket, info] : in_flight) {
+        auto & bs = buf_states[info.buf_idx];
+        if (bs.layer_idx == info.layer_idx) {
+            bs.expert_loaded[info.tensor_idx][info.expert_idx] = true;
+        }
+    }
+    in_flight.clear();
+
+    // Phase 3: Set tensor->data pointers for all layers
+    for (int il = 0; il < (int)layers.size(); il++) {
+        // Initialize buffer state for this layer
+        const auto & layer = layers[il];
+        auto & bs = buf_states[buf_idx];
+        bs.layer_idx = il;
+        bs.expert_loaded.resize(layer.tensors.size());
+        for (size_t t = 0; t < layer.tensors.size(); t++) {
+            bs.expert_loaded[t].assign(layer.tensors[t].n_expert, false);
+        }
+
+        // Mark predicted experts as loaded
+        auto predicted = predict_experts(il);
+        for (int expert_idx : predicted) {
+            for (size_t t = 0; t < layer.tensors.size(); t++) {
+                if (expert_idx >= 0 && expert_idx < layer.tensors[t].n_expert) {
+                    bs.expert_loaded[t][expert_idx] = true;
+                }
+            }
+        }
+
+        // Point tensor->data to buffer
+        for (const auto & ti : layer.tensors) {
+            ti.tensor->data = (uint8_t *)buffers[buf_idx] + ti.tensor_offset;
+        }
+    }
+
+    stats_.t_preload_us += (double)(ggml_time_us() - t0);
+}
+
+void llama_ssd_manager::scan_graph_for_topk(struct ggml_cgraph * gf) {
+    for (auto & layer : layers) {
+        layer.topk_tensor = nullptr;
+    }
+
+    int n_nodes = ggml_graph_n_nodes(gf);
+    for (int i = 0; i < n_nodes; i++) {
+        ggml_tensor * node = ggml_graph_node(gf, i);
+        const char * name = ggml_get_name(node);
+        if (strncmp(name, "ffn_moe_topk-", 13) == 0) {
+            int il = atoi(name + 13);
+            if (il >= 0 && il < (int)layers.size()) {
+                layers[il].topk_tensor = node;
+            }
+        }
+    }
+}
+
+bool llama_ssd_manager::update_predictions_from_graph() {
+    bool any_mismatch = false;
+
+    for (int il = 0; il < (int)layers.size(); il++) {
+        const auto & layer = layers[il];
+        if (!layer.topk_tensor || !layer.topk_tensor->data) continue;
+
+        const int32_t * actual = (const int32_t *)layer.topk_tensor->data;
+        int n_selected = (int)layer.topk_tensor->ne[0];
+
+        // Check if prediction matched
+        const auto & predicted = last_selected[il];
+        if ((int)predicted.size() != n_selected) {
+            any_mismatch = true;
+        } else {
+            for (int i = 0; i < n_selected; i++) {
+                bool found = false;
+                for (int j = 0; j < (int)predicted.size(); j++) {
+                    if (actual[i] == predicted[j]) { found = true; break; }
+                }
+                if (!found) { any_mismatch = true; break; }
+            }
+        }
+
+        update_prediction(il, actual, n_selected);
+    }
+
+    return any_mismatch;
+}

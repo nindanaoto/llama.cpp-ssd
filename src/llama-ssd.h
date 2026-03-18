@@ -34,6 +34,7 @@ struct ssd_layer_info {
     int layer_idx = -1;
     std::vector<ssd_tensor_info> tensors; // typically 2-3 (gate_up_exps + down_exps, or gate + up + down)
     size_t total_bytes = 0;               // sum of ggml_nbytes for all expert tensors in this layer
+    ggml_tensor * topk_tensor = nullptr;  // ffn_moe_topk output for reading actual selections post-compute
 };
 
 // State of one double-buffer slot
@@ -90,6 +91,19 @@ public:
     // Get which layer the pending prefetch targets (-1 if none)
     int get_prefetch_target_layer() const { return prefetch_target_layer; }
 
+    // === Preload-all mode: load ALL layers' predicted experts in one burst ===
+
+    // Preload predicted experts for ALL layers via io_uring, wait for completion,
+    // and set all tensor->data pointers. No callback needed during graph compute.
+    void preload_all_layers();
+
+    // After graph build: scan graph for topk tensors per layer
+    void scan_graph_for_topk(struct ggml_cgraph * gf);
+
+    // After graph compute: read actual expert selections, update predictions,
+    // and return true if any misprediction was detected (caller should recompute)
+    bool update_predictions_from_graph();
+
     // Statistics
     struct stats {
         uint64_t n_prefetch_hits = 0;
@@ -98,6 +112,7 @@ public:
         uint64_t bytes_loaded = 0;
         double   t_io_us = 0;          // total I/O time (sync loads only)
         double   t_wait_us = 0;        // total time waiting for async completions
+        double   t_preload_us = 0;     // total time in preload_all_layers
     };
     stats get_stats() const { return stats_; }
     void  reset_stats() { stats_ = {}; }
