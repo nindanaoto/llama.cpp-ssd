@@ -14,7 +14,10 @@
 #include <sys/stat.h>
 #endif
 
-llama_ssd_manager::llama_ssd_manager() = default;
+llama_ssd_manager::llama_ssd_manager(int n_buf_slots)
+    : n_buf_slots_(n_buf_slots), buffers(n_buf_slots, nullptr), buf_states(n_buf_slots) {
+    GGML_ASSERT(n_buf_slots_ >= 2 && "need at least 2 buffer slots for double-buffering");
+}
 
 llama_ssd_manager::~llama_ssd_manager() {
     for (int fd : dio_fds) {
@@ -27,7 +30,7 @@ llama_ssd_manager::~llama_ssd_manager() {
         ggml_backend_buffer_free(dummy_buf);
         dummy_buf = nullptr;
     }
-    for (int i = 0; i < N_BUF_SLOTS; i++) {
+    for (int i = 0; i < n_buf_slots_; i++) {
         if (buffers[i]) {
             free(buffers[i]);
             buffers[i] = nullptr;
@@ -115,7 +118,7 @@ void llama_ssd_manager::finalize_layout(ggml_backend_buffer_type_t buft) {
 
     // Allocate circular buffer slots with page alignment for O_DIRECT
     size_t alignment = 4096;
-    for (int i = 0; i < N_BUF_SLOTS; i++) {
+    for (int i = 0; i < n_buf_slots_; i++) {
         int ret = posix_memalign(&buffers[i], alignment, buf_size);
         if (ret != 0 || !buffers[i]) {
             LLAMA_LOG_ERROR("%s: failed to allocate SSD buffer slot %d (%.1f MB)\n",
@@ -126,7 +129,7 @@ void llama_ssd_manager::finalize_layout(ggml_backend_buffer_type_t buft) {
     }
 
     // Initialize buffer states
-    for (int b = 0; b < N_BUF_SLOTS; b++) {
+    for (int b = 0; b < n_buf_slots_; b++) {
         buf_states[b].layer_idx = -1;
         buf_states[b].expert_loaded.clear();
     }
@@ -158,10 +161,10 @@ void llama_ssd_manager::finalize_layout(ggml_backend_buffer_type_t buft) {
         n_tensors += layer.tensors.size();
     }
 
-    LLAMA_LOG_INFO("%s: SSD offloading: %zu layers, %zu tensors, buffer size %.1f MB x2 (saved %.1f MB RAM)\n",
+    LLAMA_LOG_INFO("%s: SSD offloading: %zu layers, %zu tensors, buffer size %.1f MB x%d (saved %.1f MB RAM)\n",
         __func__, layers.size(), n_tensors,
-        (double)buf_size / (1024.0 * 1024.0),
-        (double)(max_layer_bytes * layers.size() - buf_size * 2) / (1024.0 * 1024.0));
+        (double)buf_size / (1024.0 * 1024.0), n_buf_slots_,
+        (double)(max_layer_bytes * layers.size() - buf_size * n_buf_slots_) / (1024.0 * 1024.0));
 }
 
 void llama_ssd_manager::register_tensor(ggml_tensor * tensor, uint16_t file_idx, size_t file_offset, int layer_idx) {
@@ -263,8 +266,8 @@ void llama_ssd_manager::init(const std::vector<std::string> & file_paths) {
 
     initialized = true;
 
-    LLAMA_LOG_INFO("%s: SSD offloading initialized, %zu layers, buffer size %.1f MB x2, async=%s, direct_io=%s\n",
-        __func__, layers.size(), (double)buf_size / (1024.0 * 1024.0),
+    LLAMA_LOG_INFO("%s: SSD offloading initialized, %zu layers, buffer size %.1f MB x%d, async=%s, direct_io=%s\n",
+        __func__, layers.size(), (double)buf_size / (1024.0 * 1024.0), n_buf_slots_,
         io->is_async() ? "io_uring" : "sync",
         use_direct_io ? "on" : "off");
 }
@@ -352,8 +355,8 @@ uint64_t llama_ssd_manager::load_expert_async(int layer_idx, int tensor_idx, int
 void llama_ssd_manager::ensure_ready(int il, const int32_t * selected_experts, int n_selected) {
     if (il < 0 || il >= (int)layers.size()) return;
 
-    // Circular buffer: layer il maps to slot (il % N_BUF_SLOTS)
-    int use_buf = il % N_BUF_SLOTS;
+    // Circular buffer: layer il maps to slot (il % n_buf_slots_)
+    int use_buf = il % n_buf_slots_;
 
     const auto & layer = layers[il];
     auto & bs = buf_states[use_buf];
@@ -476,7 +479,7 @@ void llama_ssd_manager::ensure_ready(int il, const int32_t * selected_experts, i
 void llama_ssd_manager::activate_layer(int il) {
     if (il < 0 || il >= (int)layers.size()) return;
 
-    int buf_idx = il % N_BUF_SLOTS;
+    int buf_idx = il % n_buf_slots_;
     const auto & layer = layers[il];
 
     for (const auto & ti : layer.tensors) {
@@ -487,7 +490,7 @@ void llama_ssd_manager::activate_layer(int il) {
 void llama_ssd_manager::prefetch_start(int il) {
     if (il < 0 || il >= (int)layers.size()) return;
 
-    int buf_idx = il % N_BUF_SLOTS;
+    int buf_idx = il % n_buf_slots_;
     auto predicted = predict_experts(il);
     if (predicted.empty()) return;
 
@@ -503,14 +506,18 @@ void llama_ssd_manager::prefetch_start(int il) {
     prefetch_target_buf = buf_idx;
     prefetch_target_layer = il;
 
-    // Queue async reads for predicted experts (non-blocking), then flush once
+    // Queue async reads for predicted experts (non-blocking).
+    // Caller should call flush_io() after all prefetches are queued.
     for (int expert_idx : predicted) {
         for (size_t t = 0; t < layer.tensors.size(); t++) {
             if (expert_idx < 0 || expert_idx >= layer.tensors[t].n_expert) continue;
             load_expert_async(il, (int)t, expert_idx, buf_idx);
         }
     }
-    io->flush(); // single syscall for all queued reads — critical for RAID0 bandwidth
+}
+
+void llama_ssd_manager::flush_io() {
+    io->flush();
 }
 
 std::vector<int> llama_ssd_manager::predict_experts(int il) const {

@@ -1492,9 +1492,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     // Create SSD manager early (before buffer allocation) so we can prevent
     // RAM allocation for expert tensors by setting their data pointers
     if (params.use_ssd_offload && hparams.n_expert > 0 && !ssd_manager) {
-        ssd_manager = std::make_unique<llama_ssd_manager>();
-        LLAMA_LOG_INFO("%s: SSD offloading enabled for MoE expert weights (n_expert=%d, n_expert_used=%d)\n",
-            __func__, hparams.n_expert, hparams.n_expert_used);
+        ssd_manager = std::make_unique<llama_ssd_manager>(params.ssd_n_buf_slots);
+        LLAMA_LOG_INFO("%s: SSD offloading enabled for MoE expert weights (n_expert=%d, n_expert_used=%d, n_buf_slots=%d)\n",
+            __func__, hparams.n_expert, hparams.n_expert_used, params.ssd_n_buf_slots);
 
         // Scan all contexts to identify SSD tensors
         ggml_backend_buffer_type_t ssd_buft = nullptr;
@@ -2325,6 +2325,7 @@ llama_model_params llama_model_default_params() {
         /*.no_host                     =*/ false,
         /*.no_alloc                    =*/ false,
         /*.use_ssd_offload             =*/ false,
+        /*.ssd_n_buf_slots             =*/ 2,
     };
 
     return result;

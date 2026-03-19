@@ -1346,8 +1346,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             auto original_cb = cparams.cb_eval;
             auto original_ud = cparams.cb_eval_user_data;
 
-            // Kick off prefetch for layer 0 before graph starts
-            ssd_mgr->prefetch_start(0);
+            // Kick off prefetch for layer 0 (and further ahead if slots available)
+            int n_ahead_init = ssd_mgr->n_buf_slots() - 1;
+            for (int d = 0; d < n_ahead_init && d < ssd_mgr->n_layers(); d++) {
+                ssd_mgr->prefetch_start(d);
+            }
+            ssd_mgr->flush_io();
 
             auto ssd_cb = [ssd_mgr, original_cb, original_ud](struct ggml_tensor * t, bool ask, void * /*ud*/) -> bool {
                 const char * name = ggml_get_name(t);
@@ -1393,9 +1397,19 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                         ssd_mgr->update_prediction(il, last_tok, n_expert_used);
                     }
 
-                    // Prefetch next layer into the other buffer slot
-                    int next = (il + 1 < ssd_mgr->n_layers()) ? il + 1 : 0;
-                    ssd_mgr->prefetch_start(next);
+                    // Prefetch upcoming layers into available buffer slots.
+                    // With K buffer slots, we can have K-1 layers prefetching ahead.
+                    int n_ahead = ssd_mgr->n_buf_slots() - 1;
+                    for (int d = 1; d <= n_ahead; d++) {
+                        int target = il + d;
+                        if (target >= ssd_mgr->n_layers()) {
+                            target = (d == 1) ? 0 : -1; // wrap layer 0 only for immediate next
+                        }
+                        if (target >= 0) {
+                            ssd_mgr->prefetch_start(target);
+                        }
+                    }
+                    ssd_mgr->flush_io(); // single syscall for all prefetch reads
                 }
 
                 if (original_cb) return original_cb(t, ask, original_ud);

@@ -2247,6 +2247,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_SSD_OFFLOAD"));
     add_opt(common_arg(
+        {"--ssd-n-buf-slots"}, "N",
+        string_format("number of SSD I/O buffer slots for pipeline depth (default: %d, min: 2)\n"
+            "more slots = more I/O overlap = higher bandwidth on RAID0, but each slot\n"
+            "costs one layer's worth of expert data in RAM",
+            params.ssd_n_buf_slots),
+        [](common_params & params, int value) {
+            params.ssd_n_buf_slots = std::max(value, 2);
+        }
+    ).set_env("LLAMA_ARG_SSD_N_BUF_SLOTS"));
+    add_opt(common_arg(
         {"--numa"}, "TYPE",
         "attempt optimizations that help on some NUMA systems\n"
         "- distribute: spread execution evenly over all nodes\n"

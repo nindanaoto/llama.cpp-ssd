@@ -45,7 +45,10 @@ struct ssd_buf_state {
 
 class llama_ssd_manager {
 public:
-    llama_ssd_manager();
+    // n_buf_slots: number of circular buffer slots (default 2).
+    // More slots = deeper I/O pipeline = better RAID0 bandwidth utilization,
+    // but each slot costs max_layer_bytes of RAM.
+    explicit llama_ssd_manager(int n_buf_slots = 2);
     ~llama_ssd_manager();
 
     // Model load time: register an expert tensor for SSD offloading
@@ -77,7 +80,11 @@ public:
     void activate_layer(int il);
 
     // Start speculative prefetch for layer il into the next buffer.
+    // Queues async reads but does NOT submit — call flush_io() after all prefetches.
     void prefetch_start(int il);
+
+    // Submit all queued I/O reads to the kernel in a single syscall.
+    void flush_io();
 
     // Get predicted expert indices for layer il (based on last-used heuristic)
     std::vector<int> predict_experts(int il) const;
@@ -87,6 +94,9 @@ public:
 
     // Get number of registered layers
     int n_layers() const { return (int)layers.size(); }
+
+    // Get number of buffer slots (I/O pipeline depth)
+    int n_buf_slots() const { return n_buf_slots_; }
 
     // Get which layer the pending prefetch targets (-1 if none)
     int get_prefetch_target_layer() const { return prefetch_target_layer; }
@@ -130,13 +140,13 @@ private:
     std::vector<ssd_layer_info> layers;
 
     // Circular buffer: N slots, each holding one layer's expert data.
-    // Layer il maps to slot (il % n_buf_slots).
+    // Layer il maps to slot (il % n_buf_slots_).
     // With N=3: layer N computes from slot N%3, while layers N+1 and N+2 prefetch.
-    static constexpr int N_BUF_SLOTS = 2;
-    void * buffers[N_BUF_SLOTS] = {};
+    int n_buf_slots_;
+    std::vector<void *> buffers;
     size_t buf_size = 0; // size of each slot
 
-    ssd_buf_state buf_states[N_BUF_SLOTS];
+    std::vector<ssd_buf_state> buf_states;
 
     // Prediction state: last-used experts per layer
     std::vector<std::vector<int>> last_selected; // [layer_idx] -> expert indices

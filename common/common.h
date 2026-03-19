@@ -552,6 +552,7 @@ struct common_params {
     bool use_mmap          = true;  // enable mmap to use filesystem cache
     bool use_direct_io     = false; // read from disk without buffering
     bool use_ssd_offload   = false; // offload MoE expert weights to SSD
+    int  ssd_n_buf_slots   = 2;     // number of SSD I/O buffer slots (pipeline depth)
     bool use_mlock         = false; // use mlock to keep model in memory
     bool verbose_prompt    = false; // print prompt tokens before generation
     bool display_prompt    = true;  // print prompt before generation
