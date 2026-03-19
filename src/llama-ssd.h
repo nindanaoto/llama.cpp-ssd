@@ -3,7 +3,6 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 
-#include <atomic>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -137,10 +136,10 @@ private:
     // Get the file descriptor to use for reads (O_DIRECT if available, else regular)
     int get_read_fd(uint16_t file_idx) const;
 
-    // Background I/O thread function
-    void io_thread_func();
+    // I/O worker thread function (each worker independently picks layers)
+    void io_worker_func();
 
-    // Load all predicted experts for a layer into a buffer slot (called by I/O thread)
+    // Load all predicted experts for a layer into a buffer slot (called by worker)
     void load_layer_predicted(int il, int buf_idx);
 
     std::vector<ssd_layer_info> layers;
@@ -183,13 +182,12 @@ private:
 
     // === Background I/O thread state ===
 
-    std::thread io_thread;
+    std::vector<std::thread> io_workers; // n_io_threads_ persistent workers
     std::mutex  io_mutex;
-    std::condition_variable io_cv;      // I/O thread waits on this
+    std::condition_variable io_cv;      // I/O workers wait on this
     std::condition_variable compute_cv; // compute thread waits on this
 
-    // Which layer the I/O thread has prefetched up to (exclusive).
-    // Protected by io_mutex.
+    // Next layer to assign to an I/O worker (shared cursor, protected by io_mutex).
     int io_cursor = 0;
 
     // Which layer compute needs next. Set by begin_token / ensure_ready.

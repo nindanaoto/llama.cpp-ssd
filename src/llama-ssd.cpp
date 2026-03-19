@@ -2,7 +2,6 @@
 #include "llama-impl.h"
 
 #include <algorithm>
-#include <atomic>
 #include <cassert>
 #include <cstdlib>
 #include <cstring>
@@ -22,14 +21,14 @@ llama_ssd_manager::llama_ssd_manager(int n_buf_slots, int n_io_threads)
 }
 
 llama_ssd_manager::~llama_ssd_manager() {
-    // Stop I/O thread
+    // Stop I/O workers
     {
         std::lock_guard<std::mutex> lock(io_mutex);
         io_thread_stop = true;
     }
     io_cv.notify_all();
-    if (io_thread.joinable()) {
-        io_thread.join();
+    for (auto & w : io_workers) {
+        if (w.joinable()) w.join();
     }
 
     for (int fd : dio_fds) {
@@ -249,9 +248,14 @@ void llama_ssd_manager::init(const std::vector<std::string> & file_paths) {
 
     initialized = true;
 
-    // Start the background I/O thread
+    // Start N background I/O worker threads.
+    // Each worker independently picks layers and loads them into buffer slots.
+    // With N workers and N slots, N layers are loaded in parallel.
     io_thread_stop = false;
-    io_thread = std::thread(&llama_ssd_manager::io_thread_func, this);
+    io_workers.reserve(n_io_threads_);
+    for (int i = 0; i < n_io_threads_; i++) {
+        io_workers.emplace_back(&llama_ssd_manager::io_worker_func, this);
+    }
 
     LLAMA_LOG_INFO("%s: SSD offloading initialized, %zu layers, buffer size %.1f MB x%d, io_threads=%d, direct_io=%s\n",
         __func__, layers.size(), (double)buf_size / (1024.0 * 1024.0), n_buf_slots_,
@@ -307,8 +311,7 @@ void llama_ssd_manager::load_expert_sync(int layer_idx, int tensor_idx, int expe
     // Note: stats updated by caller, not here (thread safety for parallel I/O)
 }
 
-// Load all predicted experts for a layer into a buffer slot.
-// Uses n_io_threads_ parallel pread threads to saturate RAID0 bandwidth.
+// Load all predicted experts for a layer into a buffer slot (called by one worker).
 void llama_ssd_manager::load_layer_predicted(int il, int buf_idx) {
     auto predicted = predict_experts(il);
     if (predicted.empty()) return;
@@ -322,52 +325,28 @@ void llama_ssd_manager::load_layer_predicted(int il, int buf_idx) {
         bs.expert_loaded[t].assign(layer.tensors[t].n_expert, false);
     }
 
-    // Collect all (tensor_idx, expert_idx) work items
-    struct work_item { int tensor_idx; int expert_idx; };
-    std::vector<work_item> work;
+    uint64_t local_loads = 0;
+    uint64_t local_bytes = 0;
     for (int expert_idx : predicted) {
         for (size_t t = 0; t < layer.tensors.size(); t++) {
             if (expert_idx < 0 || expert_idx >= layer.tensors[t].n_expert) continue;
-            work.push_back({(int)t, expert_idx});
-        }
-    }
-    if (work.empty()) return;
-
-    // Parallel load: N threads each pick work items via atomic index
-    int n_workers = std::min(n_io_threads_, (int)work.size());
-    std::atomic<size_t> cursor(0);
-    auto worker_fn = [&]() {
-        while (true) {
-            size_t idx = cursor.fetch_add(1, std::memory_order_relaxed);
-            if (idx >= work.size()) break;
-            load_expert_sync(il, work[idx].tensor_idx, work[idx].expert_idx, buf_idx);
-        }
-    };
-
-    if (n_workers <= 1) {
-        worker_fn();
-    } else {
-        std::vector<std::thread> threads;
-        threads.reserve(n_workers - 1);
-        for (int i = 0; i < n_workers - 1; i++) {
-            threads.emplace_back(worker_fn);
-        }
-        worker_fn(); // coordinator thread also does work
-        for (auto & th : threads) {
-            th.join();
+            load_expert_sync(il, (int)t, expert_idx, buf_idx);
+            bs.expert_loaded[t][expert_idx] = true;
+            local_loads++;
+            local_bytes += layer.tensors[t].experts[expert_idx].slice_size;
         }
     }
 
-    // Mark loaded + update stats (single-threaded, no races)
-    for (const auto & w : work) {
-        bs.expert_loaded[w.tensor_idx][w.expert_idx] = true;
-        stats_.n_loads++;
-        stats_.bytes_loaded += layer.tensors[w.tensor_idx].experts[w.expert_idx].slice_size;
+    // Update stats under lock (multiple workers may call this concurrently)
+    {
+        std::lock_guard<std::mutex> lock(io_mutex);
+        stats_.n_loads += local_loads;
+        stats_.bytes_loaded += local_bytes;
     }
 }
 
 // Background I/O thread: continuously prefetches layers ahead of compute
-void llama_ssd_manager::io_thread_func() {
+void llama_ssd_manager::io_worker_func() {
     while (true) {
         int layer_to_load = -1;
         int buf_idx = -1;
