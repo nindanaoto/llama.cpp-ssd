@@ -371,6 +371,7 @@ void llama_ssd_manager::io_thread_func() {
     while (true) {
         int layer_to_load = -1;
         int buf_idx = -1;
+        int gen = -1;
 
         {
             std::unique_lock<std::mutex> lock(io_mutex);
@@ -378,16 +379,11 @@ void llama_ssd_manager::io_thread_func() {
             // Wait until there's work to do
             io_cv.wait(lock, [this] {
                 if (io_thread_stop) return true;
-                // Work available if io_cursor < io_target AND the target slot is not
-                // occupied by a layer that compute hasn't consumed yet
                 if (io_cursor >= io_target) return false;
 
                 int slot = io_cursor % n_buf_slots_;
-                // Slot is safe to write if:
-                // - it's empty (io_ready[slot] == -1)
-                // - OR compute has already passed the layer in this slot
                 if (io_ready[slot] >= 0 && io_ready[slot] >= compute_cursor) {
-                    return false; // slot still in use by compute, can't overwrite
+                    return false; // slot still in use by compute
                 }
                 return true;
             });
@@ -396,8 +392,8 @@ void llama_ssd_manager::io_thread_func() {
 
             layer_to_load = io_cursor;
             buf_idx = layer_to_load % n_buf_slots_;
+            gen = io_generation; // capture generation before releasing lock
 
-            // Mark slot as loading (clear ready state)
             io_ready[buf_idx] = -1;
             io_cursor++;
         }
@@ -405,10 +401,15 @@ void llama_ssd_manager::io_thread_func() {
         // Load layer outside the lock — this is the slow I/O part
         load_layer_predicted(layer_to_load, buf_idx);
 
-        // Mark slot as ready and notify compute
+        // Mark slot as ready — but ONLY if this is still the current token.
+        // If begin_token() was called while we were loading, this completion
+        // is stale and must be discarded to prevent deadlock.
         {
             std::lock_guard<std::mutex> lock(io_mutex);
-            io_ready[buf_idx] = layer_to_load;
+            if (gen == io_generation) {
+                io_ready[buf_idx] = layer_to_load;
+            }
+            // else: stale load from previous token, discard silently
         }
         compute_cv.notify_all();
     }
@@ -416,6 +417,7 @@ void llama_ssd_manager::io_thread_func() {
 
 void llama_ssd_manager::begin_token() {
     std::lock_guard<std::mutex> lock(io_mutex);
+    io_generation++;    // invalidate any in-flight loads from previous token
     io_cursor = 0;
     compute_cursor = 0;
     io_target = (int)layers.size();

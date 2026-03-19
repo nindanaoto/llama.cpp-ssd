@@ -205,5 +205,9 @@ private:
     bool io_thread_running = false;
     bool io_thread_stop = false;
 
+    // Generation counter: incremented by begin_token(). Stale completions
+    // from previous tokens are discarded by checking this counter.
+    int io_generation = 0;
+
     stats stats_;
 };
