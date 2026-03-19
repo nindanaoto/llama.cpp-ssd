@@ -326,7 +326,6 @@ extern "C" {
         bool no_alloc;        // only load metadata and simulate memory allocations
         bool use_ssd_offload;    // offload MoE expert weights to SSD, load on demand
         int  ssd_n_buf_slots;    // number of SSD I/O buffer slots (default 2, more = deeper pipeline)
-        int  ssd_n_io_threads;   // parallel pread threads per layer for expert slices (default 1)
     };
 
     struct llama_sampler_seq_config {

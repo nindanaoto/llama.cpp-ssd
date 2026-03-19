@@ -1,8 +1,8 @@
 #include "llama-ssd.h"
+#include "llama-iouring.h"
 #include "llama-impl.h"
 
 #include <algorithm>
-#include <atomic>
 #include <cassert>
 #include <cstdlib>
 #include <cstring>
@@ -14,9 +14,8 @@
 #include <sys/stat.h>
 #endif
 
-llama_ssd_manager::llama_ssd_manager(int n_buf_slots, int n_io_threads)
-    : n_buf_slots_(n_buf_slots), n_io_threads_(std::max(n_io_threads, 1)),
-      buffers(n_buf_slots, nullptr), buf_states(n_buf_slots),
+llama_ssd_manager::llama_ssd_manager(int n_buf_slots)
+    : n_buf_slots_(n_buf_slots), buffers(n_buf_slots, nullptr), buf_states(n_buf_slots),
       io_ready(n_buf_slots, -1) {
     GGML_ASSERT(n_buf_slots_ >= 2);
 }
@@ -145,12 +144,16 @@ void llama_ssd_manager::init(const std::vector<std::string> & file_paths) {
             dio_fds.assign(dio_fds.size(), -1);
         }
     }
+    // Create io_uring for batch expert reads (queue depth 256 for RAID0)
+    io = std::make_unique<llama_io_uring>(256);
+
     initialized = true;
 
     io_thread = std::thread(&llama_ssd_manager::io_thread_func, this);
 
-    LLAMA_LOG_INFO("%s: SSD offloading initialized, %zu layers, buffer %.1f MB x%d, direct_io=%s\n",
+    LLAMA_LOG_INFO("%s: SSD offloading initialized, %zu layers, buffer %.1f MB x%d, async=%s, direct_io=%s\n",
         __func__, layers.size(), (double)buf_size/(1024.0*1024.0), n_buf_slots_,
+        io->is_async() ? "io_uring" : "sync",
         use_direct_io ? "on" : "off");
 }
 
@@ -195,43 +198,38 @@ void llama_ssd_manager::load_layer_predicted(int il, int buf_idx) {
     for (size_t t = 0; t < layer.tensors.size(); t++)
         bs.expert_loaded[t].assign(layer.tensors[t].n_expert, false);
 
-    // Collect work items: each is an independent pread to a unique buffer offset
+    // Batch-submit all expert slice reads via io_uring.
+    // One flush() syscall submits all reads; the kernel dispatches them
+    // across RAID0 devices in parallel. Much more efficient than N pread syscalls.
     struct work_item { int tensor_idx; int expert_idx; };
     std::vector<work_item> work;
+
     for (int expert_idx : predicted) {
         for (size_t t = 0; t < layer.tensors.size(); t++) {
             if (expert_idx < 0 || expert_idx >= layer.tensors[t].n_expert) continue;
+            const auto & ti = layer.tensors[t];
+            const auto & slice = ti.experts[expert_idx];
+            uint8_t * dest = (uint8_t *)buffers[buf_idx] + ti.tensor_offset + expert_idx * slice.slice_size;
+
+            // Use O_DIRECT fd for aligned offsets, regular fd otherwise
+            int fd;
+            if (use_direct_io && dio_fds[slice.file_idx] >= 0 && slice.file_offset % dio_alignment == 0) {
+                fd = dio_fds[slice.file_idx];
+            } else {
+                fd = reg_fds[slice.file_idx];
+            }
+
+            io->submit_read(fd, dest, slice.slice_size, (off_t)slice.file_offset);
             work.push_back({(int)t, expert_idx});
         }
     }
-    if (work.empty()) return;
 
-    // Parallel pread: each thread picks work items via atomic cursor.
-    // Safe because each item writes to a different (tensor_offset + expert*stride)
-    // region in the buffer — no overlapping writes.
-    int n_workers = std::min(n_io_threads_, (int)work.size());
-    std::atomic<size_t> cursor(0);
-    auto worker_fn = [&]() {
-        while (true) {
-            size_t idx = cursor.fetch_add(1, std::memory_order_relaxed);
-            if (idx >= work.size()) break;
-            load_expert_sync(il, work[idx].tensor_idx, work[idx].expert_idx, buf_idx);
-        }
-    };
-
-    if (n_workers <= 1) {
-        worker_fn();
-    } else {
-        std::vector<std::thread> threads;
-        threads.reserve(n_workers - 1);
-        for (int i = 0; i < n_workers - 1; i++) {
-            threads.emplace_back(worker_fn);
-        }
-        worker_fn(); // I/O coordinator thread also does work
-        for (auto & th : threads) th.join();
+    if (!work.empty()) {
+        io->flush();    // single syscall — all reads now in kernel queue
+        io->wait_all(); // block until all complete
     }
 
-    // Update buf_states and stats (single-threaded after join — no races)
+    // Update buf_states and stats (single-threaded, no races)
     for (const auto & w : work) {
         bs.expert_loaded[w.tensor_idx][w.expert_idx] = true;
         stats_.n_loads++;
