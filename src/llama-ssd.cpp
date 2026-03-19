@@ -394,11 +394,14 @@ void llama_ssd_manager::ensure_ready(int il, const int32_t * selected_experts, i
     int use_buf = il % n_buf_slots_;
     int64_t t0 = ggml_time_us();
 
-    // Wait for the I/O thread to finish loading this layer
+    // Wait for the I/O thread to finish loading this layer.
+    // compute_cursor = il means "layers 0..il-1 have finished compute, their slots are free."
+    // We do NOT set il+1 here because layer il's MoE compute hasn't happened yet —
+    // the slot must remain valid until the NEXT layer's ensure_ready fires.
     {
         std::unique_lock<std::mutex> lock(io_mutex);
-        compute_cursor = il + 1; // signal that compute has reached past this layer
-        io_cv.notify_all();      // wake I/O thread in case it's waiting for slot
+        compute_cursor = il; // layers before il are done, their slots can be reused
+        io_cv.notify_all();  // wake I/O thread in case it's waiting for a slot
 
         compute_cv.wait(lock, [this, il, use_buf] {
             return io_ready[use_buf] == il;
