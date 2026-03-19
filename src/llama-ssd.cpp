@@ -16,7 +16,8 @@
 llama_ssd_manager::llama_ssd_manager(int n_buf_slots, int n_io_threads)
     : n_buf_slots_(n_buf_slots), n_io_threads_(std::max(n_io_threads, 1)),
       buffers(n_buf_slots, nullptr), buf_states(n_buf_slots),
-      io_ready(n_buf_slots, -1) {
+      io_ready(n_buf_slots, -1),
+      slot_mutexes(std::make_unique<std::mutex[]>(n_buf_slots)) {
     GGML_ASSERT(n_buf_slots_ >= 2 && "need at least 2 buffer slots for double-buffering");
 }
 
@@ -375,37 +376,36 @@ void llama_ssd_manager::io_worker_func() {
 
             io_ready[buf_idx] = -1;
             io_cursor++;
-            io_active_workers++;
         }
 
-        // Load layer outside the lock — this is the slow I/O part
+        // Lock the slot to prevent concurrent writes from stale workers.
+        // If a stale worker from the previous token is still writing to this slot,
+        // we block here until it finishes (not on io_mutex, so no global stall).
+        slot_mutexes[buf_idx].lock();
+
+        // Load layer into the buffer slot (slow I/O part)
         load_layer_predicted(layer_to_load, buf_idx);
 
-        // Mark slot as ready and decrement active count.
+        slot_mutexes[buf_idx].unlock();
+
+        // Mark slot as ready — only if still current token
         {
             std::lock_guard<std::mutex> lock(io_mutex);
             if (gen == io_generation) {
                 io_ready[buf_idx] = layer_to_load;
             }
-            io_active_workers--;
         }
-        compute_cv.notify_all(); // wake compute AND begin_token (both wait on compute_cv)
+        compute_cv.notify_all();
     }
 }
 
 void llama_ssd_manager::begin_token() {
-    std::unique_lock<std::mutex> lock(io_mutex);
+    std::lock_guard<std::mutex> lock(io_mutex);
 
-    // Stop workers from picking new layers and wait for in-flight loads to finish.
-    // Without this, a worker from the previous token could be writing to a buffer
-    // slot that a new worker also claims — corrupting both buf_states and buffer data.
-    io_target = 0; // prevent workers from picking new work
-    io_cv.notify_all();
-
-    // Wait for all active workers to finish their current load
-    compute_cv.wait(lock, [this] { return io_active_workers == 0; });
-
-    // Now safe to reset — no workers are touching buffers or buf_states
+    // No drain needed: per-slot mutexes prevent concurrent writes to the same
+    // buffer slot. Stale workers from the previous token will be blocked by
+    // the slot mutex when a new worker claims the same slot, and their results
+    // will be discarded via the generation counter.
     io_generation++;
     io_cursor = 0;
     compute_cursor = 0;
@@ -413,7 +413,7 @@ void llama_ssd_manager::begin_token() {
     for (int i = 0; i < n_buf_slots_; i++) {
         io_ready[i] = -1;
     }
-    io_cv.notify_all(); // wake workers for new token
+    io_cv.notify_all();
 }
 
 void llama_ssd_manager::ensure_ready(int il, const int32_t * selected_experts, int n_selected) {

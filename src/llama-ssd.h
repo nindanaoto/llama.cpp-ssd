@@ -203,9 +203,10 @@ private:
     bool io_thread_running = false;
     bool io_thread_stop = false;
 
-    // Number of workers actively loading (outside the lock, doing pread).
-    // begin_token() waits for this to reach 0 before resetting state.
-    int io_active_workers = 0;
+    // Per-slot mutexes: prevent two workers from writing to the same buffer
+    // slot simultaneously (e.g., stale worker from previous token vs new worker).
+    // This replaces the drain approach in begin_token(), avoiding the hang.
+    std::unique_ptr<std::mutex[]> slot_mutexes;
 
     // Generation counter: incremented by begin_token(). Stale completions
     // from previous tokens are discarded by checking this counter.
