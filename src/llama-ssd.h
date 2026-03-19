@@ -203,6 +203,10 @@ private:
     bool io_thread_running = false;
     bool io_thread_stop = false;
 
+    // Number of workers actively loading (outside the lock, doing pread).
+    // begin_token() waits for this to reach 0 before resetting state.
+    int io_active_workers = 0;
+
     // Generation counter: incremented by begin_token(). Stale completions
     // from previous tokens are discarded by checking this counter.
     int io_generation = 0;

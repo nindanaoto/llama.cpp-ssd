@@ -130,7 +130,7 @@ void llama_ssd_manager::finalize_layout(ggml_backend_buffer_type_t buft) {
                 __func__, i, (double)buf_size / (1024.0 * 1024.0));
             throw std::runtime_error("Failed to allocate SSD circular buffer");
         }
-        memset(buffers[i], 0, buf_size);
+        // No memset — buffer data is overwritten by pread before use
     }
 
     for (int b = 0; b < n_buf_slots_; b++) {
@@ -371,39 +371,49 @@ void llama_ssd_manager::io_worker_func() {
 
             layer_to_load = io_cursor;
             buf_idx = layer_to_load % n_buf_slots_;
-            gen = io_generation; // capture generation before releasing lock
+            gen = io_generation;
 
             io_ready[buf_idx] = -1;
             io_cursor++;
+            io_active_workers++;
         }
 
         // Load layer outside the lock — this is the slow I/O part
         load_layer_predicted(layer_to_load, buf_idx);
 
-        // Mark slot as ready — but ONLY if this is still the current token.
-        // If begin_token() was called while we were loading, this completion
-        // is stale and must be discarded to prevent deadlock.
+        // Mark slot as ready and decrement active count.
         {
             std::lock_guard<std::mutex> lock(io_mutex);
             if (gen == io_generation) {
                 io_ready[buf_idx] = layer_to_load;
             }
-            // else: stale load from previous token, discard silently
+            io_active_workers--;
         }
-        compute_cv.notify_all();
+        compute_cv.notify_all(); // wake compute AND begin_token (both wait on compute_cv)
     }
 }
 
 void llama_ssd_manager::begin_token() {
-    std::lock_guard<std::mutex> lock(io_mutex);
-    io_generation++;    // invalidate any in-flight loads from previous token
+    std::unique_lock<std::mutex> lock(io_mutex);
+
+    // Stop workers from picking new layers and wait for in-flight loads to finish.
+    // Without this, a worker from the previous token could be writing to a buffer
+    // slot that a new worker also claims — corrupting both buf_states and buffer data.
+    io_target = 0; // prevent workers from picking new work
+    io_cv.notify_all();
+
+    // Wait for all active workers to finish their current load
+    compute_cv.wait(lock, [this] { return io_active_workers == 0; });
+
+    // Now safe to reset — no workers are touching buffers or buf_states
+    io_generation++;
     io_cursor = 0;
     compute_cursor = 0;
     io_target = (int)layers.size();
     for (int i = 0; i < n_buf_slots_; i++) {
         io_ready[i] = -1;
     }
-    io_cv.notify_all(); // wake I/O thread
+    io_cv.notify_all(); // wake workers for new token
 }
 
 void llama_ssd_manager::ensure_ready(int il, const int32_t * selected_experts, int n_selected) {
