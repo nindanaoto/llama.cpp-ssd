@@ -3,11 +3,14 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 
+#include <atomic>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -37,7 +40,7 @@ struct ssd_layer_info {
     ggml_tensor * topk_tensor = nullptr;  // ffn_moe_topk output for reading actual selections post-compute
 };
 
-// State of one double-buffer slot
+// State of one buffer slot
 struct ssd_buf_state {
     int layer_idx = -1;                   // which layer's data is here (-1 = none)
     std::vector<std::vector<bool>> expert_loaded; // [tensor_idx][expert_idx]
@@ -72,25 +75,23 @@ public:
 
     // === Inference time ===
 
-    // Ensure that the selected experts for layer il are loaded in the active buffer.
-    // Blocks until all needed expert slices are available.
+    // Start the background I/O thread for a new token.
+    // Begins prefetching from layer 0 using predictions.
+    void begin_token();
+
+    // Signal that compute has reached layer il with the given expert selections.
+    // The I/O thread will prioritize loading these experts if not already loaded.
+    // Blocks until the requested experts are available in the buffer.
     void ensure_ready(int il, const int32_t * selected_experts, int n_selected);
 
     // Point all expert tensors for layer il to the active buffer's data.
     void activate_layer(int il);
 
-    // Start speculative prefetch for layer il into the next buffer.
-    // Queues async reads but does NOT submit — call flush_io() after all prefetches.
-    void prefetch_start(int il);
-
-    // Submit all queued I/O reads to the kernel in a single syscall.
-    void flush_io();
+    // Update prediction state after seeing actual expert selection
+    void update_prediction(int il, const int32_t * selected_experts, int n_selected);
 
     // Get predicted expert indices for layer il (based on last-used heuristic)
     std::vector<int> predict_experts(int il) const;
-
-    // Update prediction state after seeing actual expert selection
-    void update_prediction(int il, const int32_t * selected_experts, int n_selected);
 
     // Get number of registered layers
     int n_layers() const { return (int)layers.size(); }
@@ -121,7 +122,7 @@ public:
         uint64_t n_loads = 0;
         uint64_t bytes_loaded = 0;
         double   t_io_us = 0;          // total I/O time (sync loads only)
-        double   t_wait_us = 0;        // total time waiting for async completions
+        double   t_wait_us = 0;        // total time compute waited for I/O
         double   t_preload_us = 0;     // total time in preload_all_layers
     };
     stats get_stats() const { return stats_; }
@@ -131,17 +132,19 @@ private:
     // Load a specific expert slice synchronously (blocking)
     void load_expert_sync(int layer_idx, int tensor_idx, int expert_idx, int buf_idx);
 
-    // Submit async read for a specific expert slice, returns ticket
-    uint64_t load_expert_async(int layer_idx, int tensor_idx, int expert_idx, int buf_idx);
-
     // Get the file descriptor to use for reads (O_DIRECT if available, else regular)
     int get_read_fd(uint16_t file_idx) const;
+
+    // Background I/O thread function
+    void io_thread_func();
+
+    // Load all predicted experts for a layer into a buffer slot (called by I/O thread)
+    void load_layer_predicted(int il, int buf_idx);
 
     std::vector<ssd_layer_info> layers;
 
     // Circular buffer: N slots, each holding one layer's expert data.
     // Layer il maps to slot (il % n_buf_slots_).
-    // With N=3: layer N computes from slot N%3, while layers N+1 and N+2 prefetch.
     int n_buf_slots_;
     std::vector<void *> buffers;
     size_t buf_size = 0; // size of each slot
@@ -157,15 +160,6 @@ private:
 
     // Dummy buffer for SSD tensors (so backend scheduler doesn't try to allocate them)
     ggml_backend_buffer_t dummy_buf = nullptr;
-
-    // Async I/O engine
-    std::unique_ptr<llama_io_uring> io;
-
-    // Track in-flight async reads: ticket -> {layer_idx, tensor_idx, expert_idx, buf_idx}
-    struct async_read_info {
-        int layer_idx, tensor_idx, expert_idx, buf_idx;
-    };
-    std::unordered_map<uint64_t, async_read_info> in_flight;
 
     // File descriptors for expert data reading
     // Direct I/O fds (O_DIRECT) for aligned reads, regular fds as fallback
@@ -183,6 +177,30 @@ private:
 
     // Registered but not yet initialized
     bool initialized = false;
+
+    // === Background I/O thread state ===
+
+    std::thread io_thread;
+    std::mutex  io_mutex;
+    std::condition_variable io_cv;      // I/O thread waits on this
+    std::condition_variable compute_cv; // compute thread waits on this
+
+    // Which layer the I/O thread has prefetched up to (exclusive).
+    // Protected by io_mutex.
+    int io_cursor = 0;
+
+    // Which layer compute needs next. Set by begin_token / ensure_ready.
+    // Protected by io_mutex.
+    int compute_cursor = 0;
+
+    // Total layers to prefetch for current token (set by begin_token).
+    int io_target = 0;
+
+    // Per-slot readiness: io_ready[slot] = layer that is fully loaded in that slot (-1 = empty)
+    std::vector<int> io_ready;
+
+    bool io_thread_running = false;
+    bool io_thread_stop = false;
 
     stats stats_;
 };

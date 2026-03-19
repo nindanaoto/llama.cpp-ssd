@@ -1322,6 +1322,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
+    // Start background I/O thread for this token (must happen before graph compute,
+    // regardless of graph reuse — each token needs fresh expert data from SSD)
+    if (model.ssd_manager) {
+        model.ssd_manager->begin_token();
+    }
+
     if (!graph_reuse_disable && res->can_reuse(gparams)) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
@@ -1339,19 +1345,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         ggml_backend_sched_reset(sched.get());
 
         if (model.ssd_manager) {
-            // Install lightweight SSD callback for per-layer tensor swap.
-            // Prefetch is non-blocking — data is already loaded via io_uring
-            // from the previous layer's callback.
+            // Install SSD callback for per-layer expert data swap.
+            // A background I/O thread continuously prefetches layers ahead of compute,
+            // so ensure_ready() typically returns immediately without blocking.
             auto * ssd_mgr = model.ssd_manager.get();
             auto original_cb = cparams.cb_eval;
             auto original_ud = cparams.cb_eval_user_data;
-
-            // Kick off prefetch for layer 0 (and further ahead if slots available)
-            int n_ahead_init = ssd_mgr->n_buf_slots() - 1;
-            for (int d = 0; d < n_ahead_init && d < ssd_mgr->n_layers(); d++) {
-                ssd_mgr->prefetch_start(d);
-            }
-            ssd_mgr->flush_io();
 
             auto ssd_cb = [ssd_mgr, original_cb, original_ud](struct ggml_tensor * t, bool ask, void * /*ud*/) -> bool {
                 const char * name = ggml_get_name(t);
@@ -1364,7 +1363,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                     return false;
                 }
 
-                // Node computed — swap expert data and prefetch next layer
+                // Node computed — swap expert data for this layer
                 if (strncmp(name, "ffn_moe_topk-", 13) == 0) {
                     int il = atoi(name + 13);
                     const int32_t * base = (const int32_t *)t->data;
@@ -1396,20 +1395,6 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                         const int32_t * last_tok = base + (n_tokens_batch - 1) * token_stride;
                         ssd_mgr->update_prediction(il, last_tok, n_expert_used);
                     }
-
-                    // Prefetch upcoming layers into available buffer slots.
-                    // With K buffer slots, we can have K-1 layers prefetching ahead.
-                    int n_ahead = ssd_mgr->n_buf_slots() - 1;
-                    for (int d = 1; d <= n_ahead; d++) {
-                        int target = il + d;
-                        if (target >= ssd_mgr->n_layers()) {
-                            target = (d == 1) ? 0 : -1; // wrap layer 0 only for immediate next
-                        }
-                        if (target >= 0) {
-                            ssd_mgr->prefetch_start(target);
-                        }
-                    }
-                    ssd_mgr->flush_io(); // single syscall for all prefetch reads
                 }
 
                 if (original_cb) return original_cb(t, ask, original_ud);
