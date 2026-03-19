@@ -2,6 +2,7 @@
 #include "llama-impl.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <cstdlib>
 #include <cstring>
@@ -13,8 +14,9 @@
 #include <sys/stat.h>
 #endif
 
-llama_ssd_manager::llama_ssd_manager(int n_buf_slots)
-    : n_buf_slots_(n_buf_slots), buffers(n_buf_slots, nullptr), buf_states(n_buf_slots),
+llama_ssd_manager::llama_ssd_manager(int n_buf_slots, int n_io_threads)
+    : n_buf_slots_(n_buf_slots), n_io_threads_(std::max(n_io_threads, 1)),
+      buffers(n_buf_slots, nullptr), buf_states(n_buf_slots),
       io_ready(n_buf_slots, -1) {
     GGML_ASSERT(n_buf_slots_ >= 2);
 }
@@ -193,18 +195,48 @@ void llama_ssd_manager::load_layer_predicted(int il, int buf_idx) {
     for (size_t t = 0; t < layer.tensors.size(); t++)
         bs.expert_loaded[t].assign(layer.tensors[t].n_expert, false);
 
-    uint64_t local_loads = 0, local_bytes = 0;
+    // Collect work items: each is an independent pread to a unique buffer offset
+    struct work_item { int tensor_idx; int expert_idx; };
+    std::vector<work_item> work;
     for (int expert_idx : predicted) {
         for (size_t t = 0; t < layer.tensors.size(); t++) {
             if (expert_idx < 0 || expert_idx >= layer.tensors[t].n_expert) continue;
-            load_expert_sync(il, (int)t, expert_idx, buf_idx);
-            bs.expert_loaded[t][expert_idx] = true;
-            local_loads++;
-            local_bytes += layer.tensors[t].experts[expert_idx].slice_size;
+            work.push_back({(int)t, expert_idx});
         }
     }
-    stats_.n_loads += local_loads;
-    stats_.bytes_loaded += local_bytes;
+    if (work.empty()) return;
+
+    // Parallel pread: each thread picks work items via atomic cursor.
+    // Safe because each item writes to a different (tensor_offset + expert*stride)
+    // region in the buffer — no overlapping writes.
+    int n_workers = std::min(n_io_threads_, (int)work.size());
+    std::atomic<size_t> cursor(0);
+    auto worker_fn = [&]() {
+        while (true) {
+            size_t idx = cursor.fetch_add(1, std::memory_order_relaxed);
+            if (idx >= work.size()) break;
+            load_expert_sync(il, work[idx].tensor_idx, work[idx].expert_idx, buf_idx);
+        }
+    };
+
+    if (n_workers <= 1) {
+        worker_fn();
+    } else {
+        std::vector<std::thread> threads;
+        threads.reserve(n_workers - 1);
+        for (int i = 0; i < n_workers - 1; i++) {
+            threads.emplace_back(worker_fn);
+        }
+        worker_fn(); // I/O coordinator thread also does work
+        for (auto & th : threads) th.join();
+    }
+
+    // Update buf_states and stats (single-threaded after join — no races)
+    for (const auto & w : work) {
+        bs.expert_loaded[w.tensor_idx][w.expert_idx] = true;
+        stats_.n_loads++;
+        stats_.bytes_loaded += layer.tensors[w.tensor_idx].experts[w.expert_idx].slice_size;
+    }
 }
 
 // Single background I/O thread: loads layers sequentially into ring buffer.

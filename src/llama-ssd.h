@@ -44,7 +44,9 @@ struct ssd_buf_state {
 
 class llama_ssd_manager {
 public:
-    explicit llama_ssd_manager(int n_buf_slots = 2);
+    // n_io_threads: parallel pread threads per layer for expert slices (default 1).
+    // Each thread reads a different expert slice to different buffer offsets — no races.
+    explicit llama_ssd_manager(int n_buf_slots = 2, int n_io_threads = 1);
     ~llama_ssd_manager();
 
     void register_tensor(ggml_tensor * tensor, uint16_t file_idx, size_t file_offset, int layer_idx);
@@ -97,6 +99,7 @@ private:
     std::vector<ssd_layer_info> layers;
 
     int n_buf_slots_;
+    int n_io_threads_;
     std::vector<void *> buffers;
     size_t buf_size = 0;
     std::vector<ssd_buf_state> buf_states;

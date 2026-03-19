@@ -2257,6 +2257,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_SSD_N_BUF_SLOTS"));
     add_opt(common_arg(
+        {"--ssd-n-io-threads"}, "N",
+        string_format("parallel pread threads per layer for expert slice loading (default: %d)\n"
+            "each thread reads a different expert slice — set to 4-8 for RAID0",
+            params.ssd_n_io_threads),
+        [](common_params & params, int value) {
+            params.ssd_n_io_threads = std::max(value, 1);
+        }
+    ).set_env("LLAMA_ARG_SSD_N_IO_THREADS"));
+    add_opt(common_arg(
         {"--numa"}, "TYPE",
         "attempt optimizations that help on some NUMA systems\n"
         "- distribute: spread execution evenly over all nodes\n"
