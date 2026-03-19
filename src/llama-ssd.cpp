@@ -2,6 +2,7 @@
 #include "llama-impl.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <cstdlib>
 #include <cstring>
@@ -13,8 +14,9 @@
 #include <sys/stat.h>
 #endif
 
-llama_ssd_manager::llama_ssd_manager(int n_buf_slots)
-    : n_buf_slots_(n_buf_slots), buffers(n_buf_slots, nullptr), buf_states(n_buf_slots),
+llama_ssd_manager::llama_ssd_manager(int n_buf_slots, int n_io_threads)
+    : n_buf_slots_(n_buf_slots), n_io_threads_(std::max(n_io_threads, 1)),
+      buffers(n_buf_slots, nullptr), buf_states(n_buf_slots),
       io_ready(n_buf_slots, -1) {
     GGML_ASSERT(n_buf_slots_ >= 2 && "need at least 2 buffer slots for double-buffering");
 }
@@ -251,9 +253,9 @@ void llama_ssd_manager::init(const std::vector<std::string> & file_paths) {
     io_thread_stop = false;
     io_thread = std::thread(&llama_ssd_manager::io_thread_func, this);
 
-    LLAMA_LOG_INFO("%s: SSD offloading initialized, %zu layers, buffer size %.1f MB x%d, direct_io=%s, bg_io_thread=on\n",
+    LLAMA_LOG_INFO("%s: SSD offloading initialized, %zu layers, buffer size %.1f MB x%d, io_threads=%d, direct_io=%s\n",
         __func__, layers.size(), (double)buf_size / (1024.0 * 1024.0), n_buf_slots_,
-        use_direct_io ? "on" : "off");
+        n_io_threads_, use_direct_io ? "on" : "off");
 }
 
 int llama_ssd_manager::get_read_fd(uint16_t file_idx) const {
@@ -302,11 +304,11 @@ void llama_ssd_manager::load_expert_sync(int layer_idx, int tensor_idx, int expe
         }
     }
 
-    stats_.n_loads++;
-    stats_.bytes_loaded += slice.slice_size;
+    // Note: stats updated by caller, not here (thread safety for parallel I/O)
 }
 
-// Load all predicted experts for a layer into a buffer slot (called by I/O thread)
+// Load all predicted experts for a layer into a buffer slot.
+// Uses n_io_threads_ parallel pread threads to saturate RAID0 bandwidth.
 void llama_ssd_manager::load_layer_predicted(int il, int buf_idx) {
     auto predicted = predict_experts(il);
     if (predicted.empty()) return;
@@ -320,12 +322,47 @@ void llama_ssd_manager::load_layer_predicted(int il, int buf_idx) {
         bs.expert_loaded[t].assign(layer.tensors[t].n_expert, false);
     }
 
+    // Collect all (tensor_idx, expert_idx) work items
+    struct work_item { int tensor_idx; int expert_idx; };
+    std::vector<work_item> work;
     for (int expert_idx : predicted) {
         for (size_t t = 0; t < layer.tensors.size(); t++) {
             if (expert_idx < 0 || expert_idx >= layer.tensors[t].n_expert) continue;
-            load_expert_sync(il, (int)t, expert_idx, buf_idx);
-            bs.expert_loaded[t][expert_idx] = true;
+            work.push_back({(int)t, expert_idx});
         }
+    }
+    if (work.empty()) return;
+
+    // Parallel load: N threads each pick work items via atomic index
+    int n_workers = std::min(n_io_threads_, (int)work.size());
+    std::atomic<size_t> cursor(0);
+    auto worker_fn = [&]() {
+        while (true) {
+            size_t idx = cursor.fetch_add(1, std::memory_order_relaxed);
+            if (idx >= work.size()) break;
+            load_expert_sync(il, work[idx].tensor_idx, work[idx].expert_idx, buf_idx);
+        }
+    };
+
+    if (n_workers <= 1) {
+        worker_fn();
+    } else {
+        std::vector<std::thread> threads;
+        threads.reserve(n_workers - 1);
+        for (int i = 0; i < n_workers - 1; i++) {
+            threads.emplace_back(worker_fn);
+        }
+        worker_fn(); // coordinator thread also does work
+        for (auto & th : threads) {
+            th.join();
+        }
+    }
+
+    // Mark loaded + update stats (single-threaded, no races)
+    for (const auto & w : work) {
+        bs.expert_loaded[w.tensor_idx][w.expert_idx] = true;
+        stats_.n_loads++;
+        stats_.bytes_loaded += layer.tensors[w.tensor_idx].experts[w.expert_idx].slice_size;
     }
 }
 
@@ -427,6 +464,8 @@ void llama_ssd_manager::ensure_ready(int il, const int32_t * selected_experts, i
             int64_t t1 = ggml_time_us();
             load_expert_sync(il, (int)t, expert_idx, use_buf);
             stats_.t_io_us += (double)(ggml_time_us() - t1);
+            stats_.n_loads++;
+            stats_.bytes_loaded += layer.tensors[t].experts[expert_idx].slice_size;
             bs.expert_loaded[t][expert_idx] = true;
             n_misses++;
         }

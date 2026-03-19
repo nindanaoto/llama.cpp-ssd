@@ -51,7 +51,9 @@ public:
     // n_buf_slots: number of circular buffer slots (default 2).
     // More slots = deeper I/O pipeline = better RAID0 bandwidth utilization,
     // but each slot costs max_layer_bytes of RAM.
-    explicit llama_ssd_manager(int n_buf_slots = 2);
+    // n_io_threads: number of parallel I/O threads per layer (default 1).
+    // For RAID0, set to number of devices (e.g., 4) to saturate bandwidth.
+    explicit llama_ssd_manager(int n_buf_slots = 2, int n_io_threads = 1);
     ~llama_ssd_manager();
 
     // Model load time: register an expert tensor for SSD offloading
@@ -146,6 +148,7 @@ private:
     // Circular buffer: N slots, each holding one layer's expert data.
     // Layer il maps to slot (il % n_buf_slots_).
     int n_buf_slots_;
+    int n_io_threads_;
     std::vector<void *> buffers;
     size_t buf_size = 0; // size of each slot
 
