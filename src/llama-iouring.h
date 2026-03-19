@@ -13,8 +13,13 @@ public:
     explicit llama_io_uring(int queue_depth = 64);
     ~llama_io_uring();
 
-    // Submit an async read. Returns a ticket ID for later completion check.
+    // Queue an async read (does NOT submit to kernel yet). Returns a ticket ID.
+    // Call flush() after queuing all reads to submit them in a single syscall.
     uint64_t submit_read(int fd, void * dest, size_t size, off_t offset);
+
+    // Submit all queued SQEs to the kernel in one syscall.
+    // This is the key to saturating RAID0 bandwidth: batch many reads, submit once.
+    void flush();
 
     // Block until a specific ticket completes. Returns bytes read.
     ssize_t wait_for(uint64_t ticket);

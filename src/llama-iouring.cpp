@@ -35,6 +35,8 @@ struct llama_io_uring::impl {
         }
     }
 
+    int n_queued = 0; // SQEs queued but not yet submitted
+
     uint64_t submit_read(int fd, void * dest, size_t size, off_t offset) {
         if (!ring_initialized) {
             // Sync fallback
@@ -46,7 +48,8 @@ struct llama_io_uring::impl {
 
         struct io_uring_sqe * sqe = io_uring_get_sqe(&ring);
         if (!sqe) {
-            // SQ full — drain some completions first
+            // SQ full — flush queued SQEs and drain some completions
+            flush_impl();
             drain_cqe(1);
             sqe = io_uring_get_sqe(&ring);
             if (!sqe) {
@@ -62,20 +65,25 @@ struct llama_io_uring::impl {
         io_uring_prep_read(sqe, fd, dest, (unsigned)size, offset);
         io_uring_sqe_set_data64(sqe, ticket);
 
-        int ret = io_uring_submit(&ring);
-        if (ret < 0) {
-            // Submit failed — sync fallback
-            ssize_t bytes = pread(fd, dest, size, offset);
-            results[ticket] = bytes;
-            return ticket;
-        }
-
+        n_queued++;
         n_pending++;
         results[ticket] = -1; // not yet complete
         return ticket;
     }
 
+    void flush_impl() {
+        if (!ring_initialized || n_queued == 0) return;
+        int ret = io_uring_submit(&ring);
+        if (ret < 0) {
+            LLAMA_LOG_ERROR("%s: io_uring_submit failed: %s\n", __func__, strerror(-ret));
+        }
+        n_queued = 0;
+    }
+
     ssize_t wait_for(uint64_t ticket) {
+        // Flush any queued SQEs before waiting
+        flush_impl();
+
         // Check if already completed
         auto it = results.find(ticket);
         if (it != results.end() && it->second >= 0) {
@@ -118,6 +126,7 @@ struct llama_io_uring::impl {
     }
 
     void wait_all() {
+        flush_impl();
         if (!ring_initialized) return;
 
         while (n_pending > 0) {
@@ -136,6 +145,7 @@ struct llama_io_uring::impl {
     }
 
     int reap_completed(std::vector<uint64_t> & completed) {
+        flush_impl();
         if (!ring_initialized) return 0;
 
         int reaped = 0;
@@ -185,6 +195,8 @@ struct llama_io_uring::impl {
         return ticket;
     }
 
+    void flush_impl() {}
+
     ssize_t wait_for(uint64_t ticket) {
         auto it = results.find(ticket);
         if (it == results.end()) return -1;
@@ -214,6 +226,10 @@ llama_io_uring::~llama_io_uring() { delete pimpl; }
 
 uint64_t llama_io_uring::submit_read(int fd, void * dest, size_t size, off_t offset) {
     return pimpl->submit_read(fd, dest, size, offset);
+}
+
+void llama_io_uring::flush() {
+    pimpl->flush_impl();
 }
 
 ssize_t llama_io_uring::wait_for(uint64_t ticket) {

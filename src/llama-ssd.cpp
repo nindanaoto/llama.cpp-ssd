@@ -258,7 +258,8 @@ void llama_ssd_manager::init(const std::vector<std::string> & file_paths) {
     }
 
     // Create io_uring instance for async I/O
-    io = std::make_unique<llama_io_uring>(64);
+    // Queue depth 256 to saturate multi-device RAID0 arrays
+    io = std::make_unique<llama_io_uring>(256);
 
     initialized = true;
 
@@ -402,7 +403,10 @@ void llama_ssd_manager::ensure_ready(int il, const int32_t * selected_experts, i
         }
     }
 
-    // Load any missing expert slices synchronously (mispredictions)
+    // Load any missing expert slices via async I/O (mispredictions).
+    // Queue all misses first, flush once, then wait — parallelizes across RAID0 devices.
+    int64_t t0 = ggml_time_us();
+    int n_misses = 0;
     for (int s = 0; s < n_selected; s++) {
         int expert_idx = selected_experts[s];
         for (size_t t = 0; t < layer.tensors.size(); t++) {
@@ -412,11 +416,60 @@ void llama_ssd_manager::ensure_ready(int il, const int32_t * selected_experts, i
                 continue;
             }
             stats_.n_prefetch_misses++;
-            int64_t t0 = ggml_time_us();
-            load_expert_sync(il, (int)t, expert_idx, use_buf);
-            stats_.t_io_us += (double)(ggml_time_us() - t0);
-            bs.expert_loaded[t][expert_idx] = true;
+            load_expert_async(il, (int)t, expert_idx, use_buf);
+            n_misses++;
         }
+    }
+    if (n_misses > 0) {
+        io->flush(); // single syscall for all miss reads
+
+        // Wait for all miss reads to complete
+        std::vector<uint64_t> completed;
+        while (!in_flight.empty()) {
+            // Check for any in-flight reads targeting this layer+buffer
+            bool has_pending = false;
+            for (const auto & [ticket, info] : in_flight) {
+                if (info.buf_idx == use_buf && info.layer_idx == il) {
+                    has_pending = true;
+                    break;
+                }
+            }
+            if (!has_pending) break;
+
+            completed.clear();
+            io->reap_completed(completed);
+            if (completed.empty()) {
+                // Nothing ready yet — block on one completion
+                // Pick any in-flight ticket for this layer
+                uint64_t wait_ticket = 0;
+                for (const auto & [ticket, info] : in_flight) {
+                    if (info.buf_idx == use_buf && info.layer_idx == il) {
+                        wait_ticket = ticket;
+                        break;
+                    }
+                }
+                if (wait_ticket > 0) {
+                    io->wait_for(wait_ticket);
+                    auto it = in_flight.find(wait_ticket);
+                    if (it != in_flight.end()) {
+                        bs.expert_loaded[it->second.tensor_idx][it->second.expert_idx] = true;
+                        in_flight.erase(it);
+                    }
+                }
+                continue;
+            }
+            for (uint64_t ticket : completed) {
+                auto it = in_flight.find(ticket);
+                if (it != in_flight.end()) {
+                    auto & info = it->second;
+                    if (info.buf_idx == use_buf && info.layer_idx == il) {
+                        bs.expert_loaded[info.tensor_idx][info.expert_idx] = true;
+                    }
+                    in_flight.erase(it);
+                }
+            }
+        }
+        stats_.t_io_us += (double)(ggml_time_us() - t0);
     }
 }
 
@@ -450,13 +503,14 @@ void llama_ssd_manager::prefetch_start(int il) {
     prefetch_target_buf = buf_idx;
     prefetch_target_layer = il;
 
-    // Submit async reads for predicted experts (non-blocking)
+    // Queue async reads for predicted experts (non-blocking), then flush once
     for (int expert_idx : predicted) {
         for (size_t t = 0; t < layer.tensors.size(); t++) {
             if (expert_idx < 0 || expert_idx >= layer.tensors[t].n_expert) continue;
             load_expert_async(il, (int)t, expert_idx, buf_idx);
         }
     }
+    io->flush(); // single syscall for all queued reads — critical for RAID0 bandwidth
 }
 
 std::vector<int> llama_ssd_manager::predict_experts(int il) const {
