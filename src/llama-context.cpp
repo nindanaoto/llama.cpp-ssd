@@ -1363,12 +1363,35 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                 // Node computed — swap expert data and prefetch next layer
                 if (strncmp(name, "ffn_moe_topk-", 13) == 0) {
                     int il = atoi(name + 13);
-                    const int32_t * selected = (const int32_t *)t->data;
-                    int n_selected = (int)t->ne[0];
+                    const int32_t * base = (const int32_t *)t->data;
+                    int n_expert_used  = (int)t->ne[0];
+                    int n_tokens_batch = (int)t->ne[1];
 
-                    ssd_mgr->ensure_ready(il, selected, n_selected);
-                    ssd_mgr->activate_layer(il);
-                    ssd_mgr->update_prediction(il, selected, n_selected);
+                    if (n_tokens_batch <= 1) {
+                        // Single token: data is contiguous, use directly
+                        ssd_mgr->ensure_ready(il, base, n_expert_used);
+                        ssd_mgr->activate_layer(il);
+                        ssd_mgr->update_prediction(il, base, n_expert_used);
+                    } else {
+                        // Batched tokens: topk is a VIEW with stride nb[1] = n_expert * sizeof(int32_t),
+                        // NOT n_expert_used * sizeof(int32_t). Must walk strides to collect all experts.
+                        size_t token_stride = t->nb[1] / sizeof(int32_t);
+                        std::vector<int32_t> all_experts;
+                        all_experts.reserve(n_expert_used * n_tokens_batch);
+                        for (int tok = 0; tok < n_tokens_batch; tok++) {
+                            const int32_t * tok_data = base + tok * token_stride;
+                            for (int e = 0; e < n_expert_used; e++) {
+                                all_experts.push_back(tok_data[e]);
+                            }
+                        }
+
+                        ssd_mgr->ensure_ready(il, all_experts.data(), (int)all_experts.size());
+                        ssd_mgr->activate_layer(il);
+
+                        // For prediction, use last token's experts (best predictor for next single-token generation)
+                        const int32_t * last_tok = base + (n_tokens_batch - 1) * token_stride;
+                        ssd_mgr->update_prediction(il, last_tok, n_expert_used);
+                    }
 
                     // Prefetch next layer into the other buffer slot
                     int next = (il + 1 < ssd_mgr->n_layers()) ? il + 1 : 0;
