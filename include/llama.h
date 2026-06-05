@@ -326,6 +326,15 @@ extern "C" {
         bool no_alloc;        // only load metadata and simulate memory allocations
         bool use_ssd_offload;    // offload MoE expert weights to SSD, load on demand
         int  ssd_n_buf_slots;    // number of SSD I/O buffer slots (default 2, more = deeper pipeline)
+        const char * ssd_stripe_dirs;  // comma-separated directories with SSD expert stripe files
+        const char * ssd_stripe_name;  // expert stripe sidecar name; if NULL, derived from model path
+        size_t ssd_stripe_chunk_size;  // expert stripe chunk size in bytes (default 1 MiB)
+        size_t ssd_read_chunk_size;    // max runtime SSD read size in bytes, 0 = use manifest chunks
+        bool ssd_use_direct_io;        // use DirectIO for SSD expert reads when available
+        int  ssd_predict_history; // number of previous routed expert sets to prefetch per layer
+        int  ssd_prefetch_window; // max SSD-prefetched layers in flight (default 1)
+        int  ssd_cpu_layers; // keep expert tensors for first N layers in CPU RAM
+        size_t ssd_cache_size; // RAM cache size for reusable SSD expert slices
     };
 
     struct llama_sampler_seq_config {

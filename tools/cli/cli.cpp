@@ -674,6 +674,9 @@ int llama_cli(int argc, char ** argv) {
 
     // bump the log level to display timings
     common_log_set_verbosity_thold(LOG_LEVEL_INFO);
+    if (params.show_timings) {
+        llama_perf_context_print(ctx_cli.ctx_server.get_llama_context());
+    }
     common_memory_breakdown_print(ctx_cli.ctx_server.get_llama_context());
 
     return 0;

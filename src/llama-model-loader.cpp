@@ -1539,7 +1539,7 @@ bool llama_model_loader::load_all_data(
         size_t n_size = ggml_nbytes(cur);
 
         // SSD offloading: register expert tensors but don't load their data
-        if (ssd_manager && llama_ssd_manager::is_expert_weight(ggml_get_name(cur))) {
+        if (ssd_manager && ssd_manager->should_offload_weight(ggml_get_name(cur))) {
             int layer_idx = -1;
             sscanf(ggml_get_name(cur), "blk.%d.", &layer_idx);
             if (layer_idx >= 0) {
@@ -1698,7 +1698,7 @@ bool llama_model_loader::load_all_data(
             if (ssd_manager) {
                 size_t total_unmapped = 0;
                 for (struct ggml_tensor * cur = ggml_get_first_tensor(ctx); cur != NULL; cur = ggml_get_next_tensor(ctx, cur)) {
-                    if (!llama_ssd_manager::is_expert_weight(ggml_get_name(cur))) continue;
+                    if (!ssd_manager->should_offload_weight(ggml_get_name(cur))) continue;
                     const auto * weight = get_weight(ggml_get_name(cur));
                     if (!weight) continue;
                     if (weight->idx < mappings.size()) {

@@ -1530,6 +1530,15 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.use_direct_io   = params.use_direct_io;
     mparams.use_ssd_offload  = params.use_ssd_offload;
     mparams.ssd_n_buf_slots  = params.ssd_n_buf_slots;
+    mparams.ssd_stripe_dirs  = params.ssd_stripe_dirs.empty() ? nullptr : params.ssd_stripe_dirs.c_str();
+    mparams.ssd_stripe_name  = params.ssd_stripe_name.empty() ? nullptr : params.ssd_stripe_name.c_str();
+    mparams.ssd_stripe_chunk_size = params.ssd_stripe_chunk_size;
+    mparams.ssd_read_chunk_size = params.ssd_read_chunk_size;
+    mparams.ssd_use_direct_io = params.ssd_use_direct_io;
+    mparams.ssd_predict_history = params.ssd_predict_history;
+    mparams.ssd_prefetch_window = params.ssd_prefetch_window;
+    mparams.ssd_cpu_layers = params.ssd_cpu_layers;
+    mparams.ssd_cache_size = params.ssd_cache_size;
     mparams.use_mlock       = params.use_mlock;
     mparams.check_tensors   = params.check_tensors;
     mparams.use_extra_bufts = !params.no_extra_bufts;

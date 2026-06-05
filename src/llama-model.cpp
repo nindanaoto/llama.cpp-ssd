@@ -1492,7 +1492,17 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     // Create SSD manager early (before buffer allocation) so we can prevent
     // RAM allocation for expert tensors by setting their data pointers
     if (params.use_ssd_offload && hparams.n_expert > 0 && !ssd_manager) {
-        ssd_manager = std::make_unique<llama_ssd_manager>(params.ssd_n_buf_slots);
+        ssd_manager = std::make_unique<llama_ssd_manager>(
+                params.ssd_n_buf_slots,
+                params.ssd_stripe_dirs ? params.ssd_stripe_dirs : "",
+                params.ssd_stripe_name ? params.ssd_stripe_name : "",
+                params.ssd_stripe_chunk_size,
+                params.ssd_read_chunk_size,
+                params.ssd_use_direct_io,
+                params.ssd_predict_history,
+                params.ssd_prefetch_window,
+                params.ssd_cpu_layers,
+                params.ssd_cache_size);
         LLAMA_LOG_INFO("%s: SSD offloading enabled for MoE expert weights (n_expert=%d, n_expert_used=%d, n_buf_slots=%d)\n",
             __func__, hparams.n_expert, hparams.n_expert_used, params.ssd_n_buf_slots);
 
@@ -2326,6 +2336,15 @@ llama_model_params llama_model_default_params() {
         /*.no_alloc                    =*/ false,
         /*.use_ssd_offload             =*/ false,
         /*.ssd_n_buf_slots             =*/ 2,
+        /*.ssd_stripe_dirs             =*/ nullptr,
+        /*.ssd_stripe_name             =*/ nullptr,
+        /*.ssd_stripe_chunk_size       =*/ 1024 * 1024,
+        /*.ssd_read_chunk_size         =*/ 0,
+        /*.ssd_use_direct_io           =*/ true,
+        /*.ssd_predict_history         =*/ 1,
+        /*.ssd_prefetch_window         =*/ 1,
+        /*.ssd_cpu_layers              =*/ 0,
+        /*.ssd_cache_size              =*/ 0,
     };
 
     return result;

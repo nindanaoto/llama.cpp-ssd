@@ -553,6 +553,15 @@ struct common_params {
     bool use_direct_io     = false; // read from disk without buffering
     bool use_ssd_offload   = false; // offload MoE expert weights to SSD
     int  ssd_n_buf_slots   = 2;     // number of SSD I/O buffer slots (pipeline depth)
+    std::string ssd_stripe_dirs;    // comma-separated SSD stripe dirs for expert sidecar
+    std::string ssd_stripe_name;    // SSD stripe sidecar name
+    size_t ssd_stripe_chunk_size = 1024 * 1024; // SSD stripe chunk size
+    size_t ssd_read_chunk_size = 0; // max runtime SSD read size, 0 = use sidecar chunks
+    bool ssd_use_direct_io = true;  // use DirectIO for SSD expert reads when available
+    int  ssd_predict_history = 1;   // previous routed expert sets to prefetch per layer
+    int  ssd_prefetch_window = 1;   // SSD-prefetched layers in flight
+    int  ssd_cpu_layers = 0;        // expert layers kept resident in CPU RAM before SSD offload
+    size_t ssd_cache_size = 0;      // RAM cache for reusable SSD expert slices
     bool use_mlock         = false; // use mlock to keep model in memory
     bool verbose_prompt    = false; // print prompt tokens before generation
     bool display_prompt    = true;  // print prompt before generation

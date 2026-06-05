@@ -1356,7 +1356,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                 const char * name = ggml_get_name(t);
 
                 if (ask) {
-                    if (strncmp(name, "ffn_moe_topk-", 13) == 0) {
+                    if (strncmp(name, "ffn_moe_topk-", 13) == 0 ||
+                            strncmp(name, "ffn_moe_ssd_wait-", 17) == 0 ||
+                            strncmp(name, "ffn_moe_ssd_wait_down-", 22) == 0) {
                         return true;
                     }
                     if (original_cb) return original_cb(t, ask, original_ud);
@@ -1372,8 +1374,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
                     if (n_tokens_batch <= 1) {
                         // Single token: data is contiguous, use directly
-                        ssd_mgr->ensure_ready(il, base, n_expert_used);
-                        ssd_mgr->activate_layer(il);
+                        ssd_mgr->request_ready(il, base, n_expert_used);
                         ssd_mgr->update_prediction(il, base, n_expert_used);
                     } else {
                         // Batched tokens: topk is a VIEW with stride nb[1] = n_expert * sizeof(int32_t),
@@ -1388,13 +1389,18 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                             }
                         }
 
-                        ssd_mgr->ensure_ready(il, all_experts.data(), (int)all_experts.size());
-                        ssd_mgr->activate_layer(il);
+                        ssd_mgr->request_ready(il, all_experts.data(), (int)all_experts.size());
 
                         // For prediction, use last token's experts (best predictor for next single-token generation)
                         const int32_t * last_tok = base + (n_tokens_batch - 1) * token_stride;
                         ssd_mgr->update_prediction(il, last_tok, n_expert_used);
                     }
+                } else if (strncmp(name, "ffn_moe_ssd_wait-", 17) == 0) {
+                    int il = atoi(name + 17);
+                    ssd_mgr->finish_ready(il);
+                } else if (strncmp(name, "ffn_moe_ssd_wait_down-", 22) == 0) {
+                    int il = atoi(name + 22);
+                    ssd_mgr->finish_down_ready(il);
                 }
 
                 if (original_cb) return original_cb(t, ask, original_ud);
@@ -4160,12 +4166,17 @@ void llama_perf_context_print(const llama_context * ctx) {
         auto ssd_stats = ctx->get_model().ssd_manager->get_stats();
         uint64_t total = ssd_stats.n_prefetch_hits + ssd_stats.n_prefetch_misses;
         double hit_rate = total > 0 ? 100.0 * ssd_stats.n_prefetch_hits / total : 0.0;
-        double bw_mbps = ssd_stats.t_io_us > 0 ? ssd_stats.bytes_loaded / ssd_stats.t_io_us : 0.0;
-        LLAMA_LOG_INFO("%s:     SSD offload: %lu loads, %.1f MB read, hit rate %.1f%% (%lu/%lu), sync I/O %.1f ms, wait %.1f ms, BW %.0f MB/s\n",
+        double prefetch_bw_mbps = ssd_stats.t_preload_us > 0 ? ssd_stats.bytes_prefetched / ssd_stats.t_preload_us : 0.0;
+        double miss_bw_mbps = ssd_stats.t_io_us > 0 ? ssd_stats.bytes_missed / ssd_stats.t_io_us : 0.0;
+        LLAMA_LOG_INFO("%s:     SSD offload: %lu loads, %.1f MB read, hit rate %.1f%% (%lu/%lu), prefetch %.1f MB in %.1f ms (%.0f MB/s), miss %.1f MB in %.1f ms (%.0f MB/s), wait %.1f ms\n",
             __func__, (unsigned long)ssd_stats.n_loads,
             (double)ssd_stats.bytes_loaded / (1024.0 * 1024.0),
             hit_rate, (unsigned long)ssd_stats.n_prefetch_hits, (unsigned long)total,
-            ssd_stats.t_io_us / 1000.0, ssd_stats.t_wait_us / 1000.0, bw_mbps);
+            (double)ssd_stats.bytes_prefetched / (1024.0 * 1024.0),
+            ssd_stats.t_preload_us / 1000.0, prefetch_bw_mbps,
+            (double)ssd_stats.bytes_missed / (1024.0 * 1024.0),
+            ssd_stats.t_io_us / 1000.0, miss_bw_mbps,
+            ssd_stats.t_wait_us / 1000.0);
     }
 }
 

@@ -23,9 +23,13 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <cctype>
 #include <cinttypes>
+#include <cstdint>
 #include <climits>
+#include <cerrno>
 #include <cstdarg>
+#include <cstdlib>
 #include <fstream>
 #include <list>
 #include <regex>
@@ -174,6 +178,40 @@ static std::vector<std::string> break_str_into_lines(std::string input, size_t m
         add_line(line);
     }
     return result;
+}
+
+static size_t parse_size_bytes(const std::string & value) {
+    if (value.empty()) {
+        throw std::invalid_argument("size must not be empty");
+    }
+
+    char * end = nullptr;
+    errno = 0;
+    unsigned long long n = std::strtoull(value.c_str(), &end, 10);
+    if (errno != 0 || end == value.c_str()) {
+        throw std::invalid_argument("invalid size: " + value);
+    }
+
+    size_t mul = 1;
+    if (*end != '\0') {
+        char suffix = (char)std::tolower((unsigned char)*end++);
+        if (*end != '\0') {
+            throw std::invalid_argument("invalid size suffix: " + value);
+        }
+        switch (suffix) {
+            case 'k': mul = 1024ULL; break;
+            case 'm': mul = 1024ULL * 1024ULL; break;
+            case 'g': mul = 1024ULL * 1024ULL * 1024ULL; break;
+            default:
+                throw std::invalid_argument("invalid size suffix: " + value);
+        }
+    }
+
+    if (n > SIZE_MAX / mul) {
+        throw std::invalid_argument("size is too large: " + value);
+    }
+
+    return (size_t)n * mul;
 }
 
 std::string common_arg::to_string() const {
@@ -2256,6 +2294,76 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.ssd_n_buf_slots = std::max(value, 2);
         }
     ).set_env("LLAMA_ARG_SSD_N_BUF_SLOTS"));
+    add_opt(common_arg(
+        {"--ssd-stripe-dirs"}, "DIRS",
+        "comma-separated directories with SSD expert stripe files",
+        [](common_params & params, const std::string & value) {
+            params.ssd_stripe_dirs = value;
+        }
+    ).set_env("LLAMA_ARG_SSD_STRIPE_DIRS"));
+    add_opt(common_arg(
+        {"--ssd-stripe-name"}, "NAME",
+        "SSD expert stripe sidecar name (default: derived from model filename)",
+        [](common_params & params, const std::string & value) {
+            params.ssd_stripe_name = value;
+        }
+    ).set_env("LLAMA_ARG_SSD_STRIPE_NAME"));
+    add_opt(common_arg(
+        {"--ssd-stripe-chunk-size"}, "N",
+        string_format("SSD expert stripe chunk size, accepts K/M/G suffixes (default: %zu)", params.ssd_stripe_chunk_size),
+        [](common_params & params, const std::string & value) {
+            params.ssd_stripe_chunk_size = parse_size_bytes(value);
+            if (params.ssd_stripe_chunk_size == 0 || params.ssd_stripe_chunk_size % 4096 != 0) {
+                throw std::invalid_argument("--ssd-stripe-chunk-size must be a non-zero multiple of 4096");
+            }
+        }
+    ).set_env("LLAMA_ARG_SSD_STRIPE_CHUNK_SIZE"));
+    add_opt(common_arg(
+        {"--ssd-read-chunk-size"}, "N",
+        string_format("maximum runtime SSD read size, accepts K/M/G suffixes (default: %zu, 0 = sidecar chunk size)", params.ssd_read_chunk_size),
+        [](common_params & params, const std::string & value) {
+            params.ssd_read_chunk_size = parse_size_bytes(value);
+            if (params.ssd_read_chunk_size != 0 && params.ssd_read_chunk_size % 4096 != 0) {
+                throw std::invalid_argument("--ssd-read-chunk-size must be 0 or a multiple of 4096");
+            }
+        }
+    ).set_env("LLAMA_ARG_SSD_READ_CHUNK_SIZE"));
+    add_opt(common_arg(
+        {"--ssd-direct-io"},
+        {"--ssd-no-direct-io"},
+        string_format("use DirectIO for SSD expert reads when available (default: %s)", params.ssd_use_direct_io ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.ssd_use_direct_io = value;
+        }
+    ).set_env("LLAMA_ARG_SSD_DIO"));
+    add_opt(common_arg(
+        {"--ssd-predict-history"}, "N",
+        string_format("number of previous routed expert sets to prefetch per layer, 0 disables predicted prefetch (default: %d)", params.ssd_predict_history),
+        [](common_params & params, int value) {
+            params.ssd_predict_history = std::max(value, 0);
+        }
+    ).set_env("LLAMA_ARG_SSD_PREDICT_HISTORY"));
+    add_opt(common_arg(
+        {"--ssd-prefetch-window"}, "N",
+        string_format("maximum SSD-prefetched layers in flight (default: %d, min: 1)", params.ssd_prefetch_window),
+        [](common_params & params, int value) {
+            params.ssd_prefetch_window = std::max(value, 1);
+        }
+    ).set_env("LLAMA_ARG_SSD_PREFETCH_WINDOW"));
+    add_opt(common_arg(
+        {"--ssd-cpu-layers"}, "N",
+        string_format("keep expert tensors for the first N layers in CPU RAM before SSD offload (default: %d, capped at 8 to avoid OOM)", params.ssd_cpu_layers),
+        [](common_params & params, int value) {
+            params.ssd_cpu_layers = std::min(std::max(value, 0), 8);
+        }
+    ).set_env("LLAMA_ARG_SSD_CPU_LAYERS"));
+    add_opt(common_arg(
+        {"--ssd-cache-size"}, "N",
+        string_format("RAM cache size for reusable SSD expert slices, accepts K/M/G suffixes (default: %zu)", params.ssd_cache_size),
+        [](common_params & params, const std::string & value) {
+            params.ssd_cache_size = parse_size_bytes(value);
+        }
+    ).set_env("LLAMA_ARG_SSD_CACHE_SIZE"));
     add_opt(common_arg(
         {"--numa"}, "TYPE",
         "attempt optimizations that help on some NUMA systems\n"

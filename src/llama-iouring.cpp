@@ -3,7 +3,10 @@
 
 #include <cassert>
 #include <cstring>
+#include <limits>
 #include <unordered_map>
+
+static constexpr ssize_t LLAMA_IO_URING_PENDING = std::numeric_limits<ssize_t>::min();
 
 #ifdef LLAMA_IO_URING
 #include <liburing.h>
@@ -67,7 +70,7 @@ struct llama_io_uring::impl {
 
         n_queued++;
         n_pending++;
-        results[ticket] = -1; // not yet complete
+        results[ticket] = LLAMA_IO_URING_PENDING; // not yet complete
         return ticket;
     }
 
@@ -86,7 +89,7 @@ struct llama_io_uring::impl {
 
         // Check if already completed
         auto it = results.find(ticket);
-        if (it != results.end() && it->second >= 0) {
+        if (it != results.end() && it->second != LLAMA_IO_URING_PENDING) {
             ssize_t ret = it->second;
             results.erase(it);
             return ret;
